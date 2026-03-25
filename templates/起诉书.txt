@@ -1,0 +1,28 @@
+# 起诉书
+
+原告：{plaintiff_info}
+被告：{defendant_info}
+
+## 诉讼请求
+
+1. {claim_1}
+2. {claim_2}
+3. {claim_3}
+
+## 事实与理由
+
+{facts}
+
+根据《中华人民共和国{law_name}》第{article_num}条之规定，{legal_basis}。
+
+综上所述，为维护原告的合法权益，特向贵院提起诉讼，恳请贵院依法判决。
+
+此致
+{court}
+
+具状人：{plaintiff}
+{date}
+
+附：
+1. 本起诉书副本{copies}份
+2. 证据清单及证据材料{evidence_count}份

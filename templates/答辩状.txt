@@ -1,0 +1,32 @@
+# 答辩状
+
+答辩人：{defendant_info}
+被答辩人：{plaintiff_info}
+
+因{case_name}一案，提出答辩如下：
+
+## 答辩请求
+
+1. {defense_request_1}
+2. {defense_request_2}
+3. {defense_request_3}
+
+## 事实与理由
+
+{facts}
+
+被答辩人的诉讼请求缺乏事实和法律依据，依法应予驳回。
+
+根据《中华人民共和国{law_name}》第{article_num}条之规定，{legal_basis}。
+
+综上所述，被答辩人的诉讼请求不能成立，恳请贵院依法驳回。
+
+此致
+{court}
+
+答辩人：{defendant}
+{date}
+
+附：
+1. 本答辩状副本{copies}份
+2. 证据清单及证据材料{evidence_count}份

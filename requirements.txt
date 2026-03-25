@@ -1,0 +1,62 @@
+# 核心依赖
+pyyaml>=6.0
+pydantic>=2.0.0
+requests>=2.31.0  # 用于调用 Ollama API
+
+# LLM 和向量模型
+transformers>=4.30.0
+torch>=2.0.0
+numpy>=1.24.0
+openai>=1.0.0  # 用于兼容 OpenAI API 格式
+
+# 向量数据库
+pymilvus==2.3.0  # 主要向量数据库
+# faiss-cpu>=1.7.0  # (已弃用，切换为 Milvus)
+# qdrant-client>=1.7.0  # (可选)
+
+# 修复 marshmallow 版本兼容性问题
+marshmallow<3.20.0  # 修复 pymilvus 依赖问题
+
+# 数据库
+peewee>=3.16.0
+
+# 多模态处理
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# 音频处理
+openai-whisper>=20231117
+soundfile>=0.12.0
+
+# 视频处理
+moviepy>=1.0.3
+ffmpeg-python>=0.2.0
+
+
+# 文本处理
+jieba>=0.42.1
+regex>=2023.0.0
+
+# Web 框架（可选，用于 API 服务）
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# 工具库
+tqdm>=4.66.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# 日志
+loguru>=0.7.0
+
+# 测试
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# 类型检查
+mypy>=1.7.0
+
+# 代码格式化
+black>=23.11.0
+flake8>=6.1.0
