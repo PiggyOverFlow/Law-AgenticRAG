@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 import logging
 from pathlib import Path
 import numpy as np
@@ -21,7 +21,7 @@ class VectorDBManager:
         # Milvus-lite 使用 uri 连接本地文件或内存
         uri = getattr(self.config.rag.vector_db, 'uri', "./data/milvus_local.db")
         token = getattr(self.config.rag.vector_db, 'password', "") # 如果有 token/password
-        
+
         # 确保数据目录存在
         file_path = Path(uri.replace("sqlite:///", "")) if "sqlite" in uri else Path(uri)
         if not file_path.parent.exists() and str(file_path.parent) != ".":
@@ -30,7 +30,7 @@ class VectorDBManager:
         # 连接 Milvus-lite (通常只需 uri)
         try:
             connections.connect(
-                alias="default", 
+                alias="default",
                 uri=uri,
                 token=token
             )
@@ -40,10 +40,10 @@ class VectorDBManager:
             raise
 
         collection_name = self.config.rag.vector_db.collection_name
-        
+
         if utility.has_collection(collection_name):
             self.collection = Collection(collection_name)
-            
+
             # 兼容处理：检查是否存在索引，如果没有则创建
             if not self.collection.has_index():
                 logger.warning(f"集合 {collection_name} 缺少索引，正在补充创建...")
@@ -53,7 +53,7 @@ class VectorDBManager:
                     "params": {}
                 }
                 self.collection.create_index(field_name="embedding", index_params=index_params)
-            
+
             self.collection.load()
             logger.info(f"加载已存在的 Milvus 集合: {collection_name}")
         else:
@@ -69,10 +69,10 @@ class VectorDBManager:
                 FieldSchema(name="effective_date", dtype=DataType.VARCHAR, max_length=20),
                 FieldSchema(name="repeal_date", dtype=DataType.VARCHAR, max_length=20),
             ]
-            
+
             schema = CollectionSchema(fields, f"Legal laws collection: {collection_name}")
             self.collection = Collection(name=collection_name, schema=schema)
-            
+
             # 创建索引 (Milvus-lite 本地模式不支持 HNSW，改用 AUTOINDEX)
             index_params = {
                 "index_type": "AUTOINDEX",
@@ -98,7 +98,7 @@ class VectorDBManager:
                 "effective_date": str(chunk.metadata.get("effective_date") or "")[:20],
                 "repeal_date": str(chunk.metadata.get("repeal_date") or "")[:20],
             })
-        
+
         self.collection.insert(data)
         self.collection.flush()
         logger.info(f"成功插入 {len(chunks)} 个片段到 Milvus 集合: {self.collection.name}")
@@ -107,7 +107,7 @@ class VectorDBManager:
         """在 Milvus 中进行向量搜索"""
         search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
         expr = self._build_expr(filters)
-        
+
         results = self.collection.search(
             data=[query_embedding],
             anns_field="embedding",
@@ -116,7 +116,7 @@ class VectorDBManager:
             expr=expr,
             output_fields=["law_name", "article_num", "content", "level", "metadata", "effective_date", "repeal_date"]
         )
-        
+
         formatted_results = []
         for result in results[0]:
             formatted_results.append({
@@ -130,7 +130,7 @@ class VectorDBManager:
                 "effective_date": result.entity.get("effective_date"),
                 "repeal_date": result.entity.get("repeal_date"),
             })
-        
+
         return formatted_results
 
     def keyword_search(self, query: str, top_k: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

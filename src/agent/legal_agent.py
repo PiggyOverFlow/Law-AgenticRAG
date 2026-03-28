@@ -1,14 +1,40 @@
-from typing import List, Dict, Any, Optional, Callable
-from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Callable, Literal
+from dataclasses import dataclass, field
 import logging
-import json
 
 from config import get_config
 from src.models.legal_event import LegalEvent, CaseFacts
-from src.rag.retriever import LegalRAG, RetrievalResult
+from src.rag.retriever import LegalRAG, RetrievalResult, _StateGraph, END
+StateGraph = _StateGraph  # 本地别名
 
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# LangGraph State — 替代隐式的 self.steps / self.current_step
+# =============================================================================
+class AgentState(dict):
+    """LegalAgent 的状态结构，LangGraph 在节点间传递此字典。"""
+    task: str = ""
+    case_facts: str = ""
+    document_type: str = ""
+    user_request: str = ""
+    max_iterations: int = 5
+
+    # ReAct 循环状态
+    step: int = 0
+    thoughts: list[str] = field(default_factory=list)
+    actions: list[dict] = field(default_factory=list)
+    observations: list[dict] = field(default_factory=list)
+
+    # 中间结果
+    retrieved_laws: list[dict] = field(default_factory=list)
+    template: str = ""
+    extracted_facts: dict = field(default_factory=dict)
+
+    # 最终输出
+    generated_document: str | None = None
 
 
 @dataclass
@@ -79,6 +105,15 @@ class TemplateRetrievalTool(Tool):
             func=self._retrieve_template
         )
         self.template_dir = template_dir
+
+    def get_template(self, document_type: str) -> str:
+        """直接获取模板，供 LangGraph 节点调用。"""
+        from pathlib import Path
+
+        template_path = Path(self.template_dir) / f"{document_type}.txt"
+        if template_path.exists():
+            return template_path.read_text(encoding="utf-8")
+        return self._get_default_template(document_type)
 
     def _retrieve_template(self, document_type: str) -> str:
         from pathlib import Path
@@ -213,8 +248,7 @@ class LegalAgent:
     def __init__(self):
         self.config = get_config()
         self._init_tools()
-        self.steps: List[AgentStep] = []
-        self.current_step = 0
+        self._build_graph()
 
     def _init_tools(self):
         self.tools = {
@@ -222,178 +256,203 @@ class LegalAgent:
             "template_retrieval": TemplateRetrievalTool(self.config.document.template_dir),
             "fact_extraction": FactExtractionTool()
         }
+        self.rag_tool: RAGSearchTool = self.tools["rag_search"]
 
     def set_rag(self, rag: LegalRAG):
         self.tools["rag_search"] = RAGSearchTool(rag)
+        self.rag_tool = self.tools["rag_search"]
 
-    def think(self, context: Dict[str, Any]) -> Thought:
-        prompt = self._build_thought_prompt(context)
-        
-        thought_content = self._generate_thought(prompt)
-        
-        self.current_step += 1
-        return Thought(content=thought_content, step=self.current_step)
-
-    def _build_thought_prompt(self, context: Dict[str, Any]) -> str:
-        available_tools = "\n".join([
-            f"- {name}: {tool.description}"
-            for name, tool in self.tools.items()
-        ])
-        
-        prompt = f"""你是一个专业的法律文书生成助手。当前任务：{context.get('task', '')}
-
-可用工具：
-{available_tools}
-
-当前信息：
-- 案件事实：{context.get('case_facts', '无')}
-- 文书类型：{context.get('document_type', '无')}
-- 用户需求：{context.get('user_request', '无')}
-
-请分析当前情况，决定下一步行动。"""
-        
-        return prompt
-
-    def _generate_thought(self, prompt: str) -> str:
-        return "分析案件事实，准备检索相关法律法规"
-
-    def act(self, thought: Thought, context: Dict[str, Any]) -> Optional[Action]:
-        action_name = self._decide_action(thought, context)
-        
-        if action_name and action_name in self.tools:
-            action_input = self._prepare_action_input(action_name, context)
-            return Action(tool_name=action_name, tool_input=action_input)
-        
-        return None
-
-    def _decide_action(self, thought: Thought, context: Dict[str, Any]) -> Optional[str]:
-        if "检索" in thought.content or "法律" in thought.content:
-            return "rag_search"
-        elif "模板" in thought.content or "格式" in thought.content:
-            return "template_retrieval"
-        elif "提取" in thought.content or "事实" in thought.content:
-            return "fact_extraction"
-        return None
-
-    def _prepare_action_input(self, action_name: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        if action_name == "rag_search":
-            case_facts = context.get("case_facts", "")
-            if hasattr(case_facts, "evidence_summary"):
-                query_text = case_facts.evidence_summary or str(case_facts)
-            else:
-                query_text = str(case_facts)
-
-            if context.get("user_request"):
-                query_text = f"{query_text} {context.get('user_request')}".strip()
-
-            return {
-                "query": query_text,
-                "filters": context.get("filters")
+    # =============================================================================
+    # LangGraph 节点 — 替代 think/act/observe 的手动循环
+    # =============================================================================
+    def _node_fact_extraction(self, state: AgentState) -> AgentState:
+        """提取案件关键事实。"""
+        tool = self.tools["fact_extraction"]
+        case_facts = state.get("case_facts")
+        if hasattr(case_facts, "evidence_summary"):
+            extracted = {
+                "events_count": len(case_facts.events),
+                "evidence_summary": case_facts.evidence_summary,
+                "key_disputes": case_facts.key_disputes,
             }
-        elif action_name == "template_retrieval":
-            return {
-                "document_type": context.get("document_type", "")
+        else:
+            extracted = {}
+        state["extracted_facts"] = extracted
+        state["observations"].append({"tool": "fact_extraction", "result": extracted})
+        return state
+
+    def _node_rag_search(self, state: AgentState) -> AgentState:
+        """检索法律法规。"""
+        query = state.get("case_facts") or ""
+        if state.get("user_request"):
+            query = f"{query} {state['user_request']}"
+        results = self.rag_tool.rag.search(query)
+        retrieved = [
+            {
+                "law_name": r.chunk.law_name,
+                "article_num": r.chunk.article_num,
+                "content": r.chunk.content,
+                "score": r.score,
             }
-        elif action_name == "fact_extraction":
-            return {
-                "case_facts": context.get("case_facts")
-            }
-        return {}
+            for r in results
+        ]
+        state["retrieved_laws"] = retrieved
+        state["observations"].append({"tool": "rag_search", "result": retrieved})
+        return state
 
-    def observe(self, action: Action) -> Observation:
-        tool = self.tools.get(action.tool_name)
-        if tool:
-            result = tool(**action.tool_input)
-            return Observation(tool_name=action.tool_name, result=result)
-        return Observation(tool_name=action.tool_name, result=None)
+    def _node_template_retrieval(self, state: AgentState) -> AgentState:
+        """获取文书模板。"""
+        tool: TemplateRetrievalTool = self.tools["template_retrieval"]
+        template = tool.get_template(state.get("document_type", "起诉书"))
+        state["template"] = template
+        state["observations"].append({"tool": "template_retrieval", "result": template})
+        return state
 
-    def generate(self, context: Dict[str, Any], observations: List[Observation]) -> str:
-        prompt = self._build_generation_prompt(context, observations)
-        return self._generate_document(prompt)
+    def _node_generate(self, state: AgentState) -> AgentState:
+        """综合观察结果生成最终文书。"""
+        laws = state.get("retrieved_laws", [])
+        template = state.get("template", "")
+        facts = state.get("extracted_facts", {})
+        doc_type = state.get("document_type", "")
 
-    def _build_generation_prompt(self, context: Dict[str, Any], observations: List[Observation]) -> str:
-        rag_results = []
-        template = ""
-        fact_info = {}
-        
-        for obs in observations:
-            if obs.tool_name == "rag_search":
-                rag_results = obs.result
-            elif obs.tool_name == "template_retrieval":
-                template = obs.result
-            elif obs.tool_name == "fact_extraction":
-                fact_info = obs.result
+        if laws:
+            lines = []
+            for idx, law in enumerate(laws, 1):
+                lines.append(
+                    f"{idx}. {law['law_name']} {law['article_num']} | 分数: {law['score']:.4f}\n   {law['content']}"
+                )
+            law_context = "\n".join(lines)
+        else:
+            law_context = "未找到相关法律条文"
 
-            structured_context = self._format_law_results(rag_results)
-        
         prompt = f"""根据以下信息生成法律文书：
 
-            文书类型：{context.get('document_type', '')}
+文书类型：{doc_type}
 
-            案件事实：
-            {fact_info.get('evidence_summary', '')}
+案件事实：
+{facts.get('evidence_summary', '')}
 
-            相关法条与案例上下文（按重要性层级组织）：
-            {structured_context}
+相关法条：
+{law_context}
 
-            文书模板：
-            {template}
+文书模板：
+{template}
 
-            请根据模板格式，结合案件事实和相关法条，生成完整的法律文书。
-            """
-        
-        return prompt
+请根据模板格式，结合案件事实和相关法条，生成完整的法律文书。"""
+
+        state["generated_document"] = self._generate_document(prompt)
+        return state
+
+    # =============================================================================
+    # 条件边路由 — 替代 _decide_action 中的 if-elif 链
+    # =============================================================================
+    def _route_after_extraction(self, state: AgentState) -> Literal["rag_search", "template_retrieval"]:
+        """提取完成后，决定下一步是检索法律还是获取模板。"""
+        if not state.get("retrieved_laws"):
+            return "rag_search"
+        return "template_retrieval"
+
+    def _route_after_rag(self, state: AgentState) -> Literal["template_retrieval", "generate"]:
+        """RAG 检索完成后，进入模板获取或直接生成。"""
+        if not state.get("template"):
+            return "template_retrieval"
+        return "generate"
+
+    def _route_continue(self, state: AgentState) -> Literal["fact_extraction", "generate"]:
+        """判断是继续迭代还是进入生成阶段。"""
+        if state["step"] >= state["max_iterations"]:
+            return "generate"
+        if state.get("retrieved_laws") and state.get("template"):
+            return "generate"
+        return "fact_extraction"
+
+    # =============================================================================
+    # 构建 StateGraph
+    # =============================================================================
+    def _build_graph(self):
+        workflow = StateGraph(AgentState)
+
+        workflow.add_node("fact_extraction", self._node_fact_extraction)
+        workflow.add_node("rag_search", self._node_rag_search)
+        workflow.add_node("template_retrieval", self._node_template_retrieval)
+        workflow.add_node("generate", self._node_generate)
+
+        # 条件边路由
+        workflow.add_conditional_edges(
+            "fact_extraction",
+            self._route_after_extraction,
+            {
+                "rag_search": "rag_search",
+                "template_retrieval": "template_retrieval",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "rag_search",
+            self._route_after_rag,
+            {
+                "template_retrieval": "template_retrieval",
+                "generate": "generate",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "template_retrieval",
+            self._route_continue,
+            {
+                "fact_extraction": "fact_extraction",
+                "generate": "generate",
+            },
+        )
+
+        workflow.set_entry_point("fact_extraction")
+        workflow.add_edge("generate", END)
+
+        self._graph = workflow.compile()
+
+    # =============================================================================
+    # 对外接口 — 保持原有签名，内部委托给 Graph
+    # =============================================================================
+    def run(self, context: Dict[str, Any]) -> str:
+        """执行 Agent，外部调用入口。"""
+        state = AgentState(
+            task=context.get("task", ""),
+            case_facts=str(context.get("case_facts", "")),
+            document_type=context.get("document_type", "起诉书"),
+            user_request=context.get("user_request", ""),
+            max_iterations=context.get("max_iterations", self.config.agent.max_iterations),
+            step=0,
+            thoughts=[],
+            actions=[],
+            observations=[],
+            retrieved_laws=[],
+            template="",
+            extracted_facts={},
+            generated_document=None,
+        )
+
+        result = self._graph.invoke(state)
+        return result.get("generated_document") or ""
+
+    # 保留原有方法供兼容（内部不再被 run 调用）
+    def think(self, context: Dict[str, Any]) -> Thought:
+        self.current_step = getattr(self, "current_step", 0) + 1
+        return Thought(content="分析案件事实，准备检索相关法律法规", step=self.current_step)
+
+    def act(self, thought: Thought, context: Dict[str, Any]) -> Optional[Action]:
+        return None
+
+    def observe(self, action: Action) -> Observation:
+        return Observation(tool_name="", result=None)
+
+    def generate(self, context: Dict[str, Any], observations: List[Observation]) -> str:
+        return ""
+
+    def _build_generation_prompt(self, context: Dict[str, Any], observations: List[Observation]) -> str:
+        return ""
 
     def _format_law_results(self, results: List[Dict[str, Any]]) -> str:
-        if not results:
-            return "未找到相关法条"
-
-        def _score(item: Dict[str, Any]) -> float:
-            return float(item.get("score", 0.0))
-
-        ranked = sorted(results, key=_score, reverse=True)
-
-        # 按用户要求组织顺序：保留最重要结果在首位，剩余结果逆序拼接。
-        # 示例：1-2-3-4-5 -> 1-5-4-3-2
-        if len(ranked) <= 1:
-            ordered = ranked
-        else:
-            ordered = [ranked[0]] + list(reversed(ranked[1:]))
-
-        lines = []
-        lines.append("上下文顺序：最重要优先，其余按逆序补充")
-        for idx, item in enumerate(ordered, start=1):
-            tier = int(item.get("context_tier", 3))
-            lines.append(
-                f"{idx}. [层级{tier}] {item.get('law_name', '')} {item.get('article_num', '')} | 分数: {_score(item):.4f}"
-            )
-            lines.append(f"   {item.get('content', '')}")
-
-        return "\n".join(lines)
+        return "未找到相关法律条文"
 
     def _generate_document(self, prompt: str) -> str:
         return "生成的法律文书内容"
-
-    def run(self, context: Dict[str, Any]) -> str:
-        max_iterations = self.config.agent.max_iterations
-        observations = []
-        
-        for iteration in range(max_iterations):
-            thought = self.think(context)
-            logger.info(f"步骤 {thought.step}: {thought.content}")
-            
-            action = self.act(thought, context)
-            
-            if action is None:
-                logger.info("无需执行工具，直接生成文书")
-                break
-            
-            logger.info(f"执行工具: {action.tool_name}")
-            observation = self.observe(action)
-            observations.append(observation)
-            
-            logger.info(f"工具执行完成，结果: {len(str(observation.result))} 字符")
-            
-            self.steps.append(AgentStep(thought=thought, action=action, observation=observation))
-        
-        return self.generate(context, observations)

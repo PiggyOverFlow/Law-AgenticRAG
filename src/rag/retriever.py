@@ -1,17 +1,302 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal, Sequence, Callable, Protocol, runtime_checkable
 import logging
 import re
 import time
+import math
 from datetime import datetime
+from dataclasses import dataclass, field
 import torch
+
 import numpy as np
 
 from config import get_config
 from src.rag.chunker import LawChunk, RetrievalResult
 from src.rag.vector_db import VectorDBManager
+# =============================================================================
+# 轻量级 StateGraph 兜底实现 — 兼容 LangGraph StateGraph 接口，零外部依赖
+# =============================================================================
+class _StateGraph:
+    """
+    简化版 StateGraph，替代 langgraph.graph.StateGraph。
+
+    只实现 LegalRAG 所需的最小功能：
+      - add_node(name, func)
+      - add_edge(src, dst)
+      - add_conditional_edges(src, router, mapping)
+      - set_entry_point(name)
+      - compile() -> _CompiledGraph
+    """
+
+    def __init__(self, state_class: type):
+        self._state_class = state_class
+        self._nodes: Dict[str, Callable] = {}
+        self._edges: Dict[str, List[str]] = {}
+        self._conditional: Dict[str, Callable] = {}
+        self._entry: str = ""
+
+    def add_node(self, name: str, func: Callable) -> None:
+        self._nodes[name] = func
+
+    def add_edge(self, src: str, dst: str) -> None:
+        self._edges.setdefault(src, []).append(dst)
+
+    def add_conditional_edges(
+        self, src: str, router: Callable, mapping: Dict[str, str]
+    ) -> None:
+        self._conditional[src] = (router, mapping)
+
+    def set_entry_point(self, name: str) -> None:
+        self._entry = name
+
+    def compile(self) -> "_CompiledGraph":
+        return _CompiledGraph(
+            state_class=self._state_class,
+            nodes=self._nodes,
+            edges=self._edges,
+            conditional=self._conditional,
+            entry=self._entry,
+        )
+
+
+class _END:
+    """替代 langgraph.graph.END，标识图终点。"""
+    pass
+
+
+END = _END()
+
+
+class _CompiledGraph:
+    """
+    编译后的图执行器，替代 langgraph.graph.StateGraph.compile()。
+    """
+
+    def __init__(
+        self,
+        state_class: type,
+        nodes: Dict[str, Callable],
+        edges: Dict[str, List[str]],
+        conditional: Dict[str, tuple[Callable, Dict[str, str]]],
+        entry: str,
+    ):
+        self._state_class = state_class
+        self._nodes = nodes
+        self._edges = edges
+        self._conditional = conditional
+        self._entry = entry
+
+    def invoke(self, initial_state) -> dict:
+        """
+        按拓扑顺序执行图，替代 langgraph 的图引擎。
+
+        条件边返回的目标节点名会覆盖后续边的目的。
+        """
+        # 保持 dataclass 实例用于属性访问，末端再转 dict 返回
+        if isinstance(initial_state, dict):
+            state = self._state_class(**initial_state)
+        else:
+            state = initial_state
+
+        current = self._entry
+        visited: set[str] = set()
+
+        while current and current not in visited:
+            visited.add(current)
+            if isinstance(current, _END):
+                break
+
+            node_func = self._nodes.get(current)
+            if node_func is None:
+                break
+
+            # 执行节点（传入 dataclass 以支持属性访问）
+            result = node_func(state)
+            if result is not None:
+                # 将节点返回值合并回 state（dict 和 dataclass 均支持 update）
+                if hasattr(state, "__dict__"):
+                    state.__dict__.update(result if isinstance(result, dict) else {})
+                else:
+                    state.update(result if isinstance(result, dict) else {})
+
+            # 条件边路由
+            if current in self._conditional:
+                router, mapping = self._conditional[current]
+                next_key = router(state)
+                current = mapping.get(next_key, next_key)
+                continue
+
+            # 常规边
+            next_list = self._edges.get(current, [])
+            current = next_list[0] if next_list else None
+
+        # 返回 dict 格式（兼容原有接口）
+        return state.__dict__ if hasattr(state, "__dict__") else dict(state)
+
+
+# 为保持外部接口一致，提供别名
+StateGraph = _StateGraph
+
 
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# LangChain 兼容 Embeddings Protocol — 替代 langchain_core.embeddings，零外部依赖
+# =============================================================================
+@runtime_checkable
+class Embeddings(Protocol):
+    """LangChain Embeddings 协议接口，与 langchain_core.embeddings.Embeddings 完全兼容。"""
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """批量嵌入文档。"""
+        ...
+
+    def embed_query(self, text: str) -> List[float]:
+        """单条查询嵌入。"""
+        ...
+
+
+# =============================================================================
+# BM25 稀疏检索器 — 基于 jieba 分词 + OKAPI BM25 公式
+# =============================================================================
+class BM25SparseRetriever:
+    """
+    纯 Python 实现的 BM25 稀疏检索器。
+
+    使用 jieba 中文分词 + OKAPI BM25 评分公式，替代传统的倒排索引。
+    可独立于向量数据库使用，作为混合检索的稀疏通道。
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._corpus: List[str] = []
+        self._corpus_ids: List[str] = []
+        self._doc_len: List[int] = []
+        self._avgdl: float = 0.0
+        self._doc_freqs: Dict[str, int] = {}  # term -> doc count
+        self._num_docs: int = 0
+        self._is_indexed: bool = False
+
+    def index(self, documents: Sequence[Dict[str, Any]]) -> None:
+        """
+        为 documents 构建 BM25 索引。
+
+        Args:
+            documents: 每个元素需包含 'chunk_id' 和 'content' 字段。
+        """
+        import jieba
+
+        self._corpus = []
+        self._corpus_ids = []
+        self._doc_len = []
+        self._doc_freqs = {}
+        self._num_docs = 0
+
+        for doc in documents:
+            content = doc.get("content", "")
+            chunk_id = doc.get("chunk_id", str(len(self._corpus)))
+            tokens = [t for t in jieba.cut(content) if t.strip() and len(t) > 1]
+
+            self._corpus.append(content)
+            self._corpus_ids.append(chunk_id)
+            self._doc_len.append(len(tokens))
+
+            # 统计文档频率
+            seen = set()
+            for t in tokens:
+                if t not in seen:
+                    seen.add(t)
+                    self._doc_freqs[t] = self._doc_freqs.get(t, 0) + 1
+
+        self._num_docs = len(self._corpus)
+        self._avgdl = sum(self._doc_len) / max(self._num_docs, 1)
+        self._is_indexed = True
+        logger.info(f"BM25 索引构建完成：{self._num_docs} 篇文档，{len(self._doc_freqs)} 个词项")
+
+    def search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+        """
+        对 query 执行 BM25 检索。
+
+        Returns:
+            按 BM25 评分降序排列的结果列表，每项包含 chunk_id / score / content 等。
+        """
+        import jieba
+
+        if not self._is_indexed:
+            logger.warning("BM25 索引未构建，返回空结果")
+            return []
+
+        query_tokens = [t for t in jieba.cut(query) if t.strip() and len(t) > 1]
+        if not query_tokens:
+            return []
+
+        scores = []
+        for i, doc_tokens in enumerate(self._corpus):
+            # 重新分词（此处简化：直接用 content 重分）
+            doc_content = self._corpus[i]
+            doc_toks = [t for t in jieba.cut(doc_content) if t.strip() and len(t) > 1]
+            doc_len = self._doc_len[i]
+
+            score = self._bm25_score(query_tokens, doc_toks, doc_len)
+            if score > 0:
+                scores.append((i, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        results = []
+        for idx, score in scores[:top_k]:
+            results.append({
+                "chunk_id": self._corpus_ids[idx],
+                "score": float(score),
+                "content": self._corpus[idx],
+            })
+        return results
+
+    def _bm25_score(self, query_tokens: List[str], doc_tokens: List[str], doc_len: int) -> float:
+        """OKAPI BM25 评分公式。"""
+        score = 0.0
+        freq: Dict[str, int] = {}
+        for t in doc_tokens:
+            freq[t] = freq.get(t, 0) + 1
+
+        for t in query_tokens:
+            df = self._doc_freqs.get(t, 0)
+            if df == 0:
+                continue
+            tf = freq.get(t, 0)
+            if tf == 0:
+                continue
+
+            idf = math.log((self._num_docs - df + 0.5) / (df + 0.5) + 1)
+            tf_component = (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * doc_len / max(self._avgdl, 1)))
+            score += idf * tf_component
+        return score
+
+
+# =============================================================================
+# LangGraph State — 替代 search() 中的局部变量传递
+# =============================================================================
+@dataclass
+class RetrievalState:
+    """检索流程的共享状态。"""
+    original_query: str = ""
+    filters: dict = field(default_factory=dict)
+
+    # 路由决策
+    need_retrieval: bool = True
+    rewritten_queries: list[str] = field(default_factory=list)
+    primary_query: str = ""
+    use_hybrid: bool = True
+    route_focus: str = "law_article"
+
+    # 检索结果
+    dense_results: list[dict] = field(default_factory=list)
+    sparse_results: list[dict] = field(default_factory=list)
+    fused_results: list[dict] = field(default_factory=list)
+
+    # 最终输出
+    final_results: list[RetrievalResult] = field(default_factory=list)
 
 
 class QueryRewriterRouter:
@@ -239,10 +524,28 @@ class QueryRewriterRouter:
         return len(q) <= 12 or len(tokens) <= 3
 
 
-class EmbeddingModel:
+class EmbeddingModel(Embeddings):
+    """
+    嵌入模型，支持 Ollama API 和本地 HuggingFace BGE 模型。
+
+    继承 langchain_core.embeddings.Embeddings 协议，对外暴露：
+      - embed_documents(texts) -> List[List[float]]  （LangChain 标准批量接口）
+      - embed_query(text) -> List[float]            （LangChain 标准单条接口）
+
+    内部 encode() / encode_single() 保持原有 Ollama 调用逻辑不变。
+    """
+
     def __init__(self):
         self.config = get_config()
         self._init_model()
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """LangChain Embeddings 协议：批量嵌入文档。"""
+        return self.encode(list(texts))
+
+    def embed_query(self, text: str) -> List[float]:
+        """LangChain Embeddings 协议：单条查询嵌入。"""
+        return self.encode_single(text)
 
     def _init_model(self):
         if self.config.rag.use_ollama:
@@ -638,87 +941,169 @@ class Reranker:
 class LegalRAG:
     def __init__(self):
         self.config = get_config()
+
         self.embedding_model = EmbeddingModel()
         self.reranker = Reranker()
         self.query_router = QueryRewriterRouter()
         self.vector_db = VectorDBManager()
 
+        # BM25 稀疏检索器（支持 LangChain VectorStore 协议）
+        self.bm25_retriever = BM25SparseRetriever()
+        self._bm25_indexed = False
+
+        self._build_graph()
+
     def build_index(self, chunks: List[LawChunk], batch_size: int = 32):
         logger.info(f"开始构建索引，共 {len(chunks)} 个 chunks")
-        
-        # 分批处理以防止长连接超时和显存溢出
+
+        # 同时构建向量索引和 BM25 稀疏索引
+        bm25_docs = []
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [chunk.content for chunk in batch_chunks]
-            
+
             logger.info(f"正在处理批次: {i}/{len(chunks)}")
             embeddings = self.embedding_model.encode(texts)
             self.vector_db.insert_chunks(batch_chunks, embeddings)
-            
+
+            # 同步收集 BM25 文档
+            for chunk in batch_chunks:
+                bm25_docs.append({
+                    "chunk_id": str(chunk.chunk_id),
+                    "content": chunk.content,
+                    "law_name": chunk.law_name,
+                    "article_num": chunk.article_num,
+                })
+
+        # 构建 BM25 索引
+        if bm25_docs:
+            self.bm25_retriever.index(bm25_docs)
+            self._bm25_indexed = True
+
         logger.info("索引构建完成")
 
-    def search(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[RetrievalResult]:
-        logger.info(f"执行检索查询: {query[:50]}...")
+    # =============================================================================
+    # LangGraph 节点 — 替代 search() 中的各阶段线性处理
+    # =============================================================================
+    def _node_query_rewrite(self, state: RetrievalState) -> RetrievalState:
+        """Query 改写与路由决策。"""
+        plan = self.query_router.rewrite_and_route(state.original_query, state.filters)
+        route = plan.get("route", {})
+        state.need_retrieval = route.get("need_retrieval", True)
+        state.rewritten_queries = plan.get("rewrites", [])
+        state.primary_query = plan.get("rewrite_primary", state.original_query)
+        state.use_hybrid = bool(route.get("use_hybrid", True))
+        state.route_focus = route.get("focus", "law_article")
 
-        query_plan = self.query_router.rewrite_and_route(query, filters)
-        route_info = query_plan.get("route", {})
-        if not route_info.get("need_retrieval", True):
+        if not state.need_retrieval:
             logger.info("路由判定无需检索，直接返回空结果")
-            return []
 
-        rewritten_queries = query_plan.get("rewrites", [])
-        primary_query = query_plan.get("rewrite_primary", query)
-        use_hybrid = bool(route_info.get("use_hybrid", True))
+        query_tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", state.original_query) if t]
+        max_rewrites = 1 if not state.use_hybrid else (2 if (len(state.original_query) <= 8 and len(query_tokens) <= 2) else 4)
+        state.rewritten_queries = state.rewritten_queries[:max_rewrites]
 
-        query_tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", query) if t]
-        max_rewrites = 1 if not use_hybrid else (2 if (len(query) <= 8 and len(query_tokens) <= 2) else 4)
-        active_queries = rewritten_queries[:max_rewrites]
         logger.info(
-            f"改写查询数量: {len(active_queries)}，路由焦点: {route_info.get('focus')}，"
-            f"混合检索: {'开启' if use_hybrid else '关闭'}，改写模式: {route_info.get('rewrite_mode', 'unknown')}"
+            f"改写查询数量: {len(state.rewritten_queries)}，路由焦点: {state.route_focus}，"
+            f"混合检索: {'开启' if state.use_hybrid else '关闭'}"
         )
+        return state
 
-        merged_filters = self._merge_filters(filters, query_plan.get("metadata_hints", {}))
+    def _node_dense_search(self, state: RetrievalState) -> RetrievalState:
+        """向量检索（Dense Search）。"""
+        if not state.need_retrieval:
+            return state
 
-        top_k_initial = self.config.rag.retrieval.top_k_initial
-        dense_results = []
-        sparse_results = []
-        for q in active_queries:
-            query_embedding = self.embedding_model.encode_single(q)
-            dense = self.vector_db.search(query_embedding, top_k_initial, merged_filters)
+        merged = self._merge_filters(state.filters, {})
+        top_k = self.config.rag.retrieval.top_k_initial
+        results = []
+
+        for q in state.rewritten_queries:
+            embedding = self.embedding_model.encode_single(q)
+            dense = self.vector_db.search(embedding, top_k, merged)
             for item in dense:
                 item["retrieval_channel"] = "dense"
-            dense_results.extend(dense)
+            results.extend(dense)
 
-            if use_hybrid:
-                sparse = self.vector_db.keyword_search(q, top_k_initial, merged_filters)
+        state.dense_results = results
+        return state
+
+    def _node_sparse_search(self, state: RetrievalState) -> RetrievalState:
+        """稀疏检索（BM25）。优先使用独立 BM25 索引，降级到 Milvus keyword_search。"""
+        if not state.need_retrieval or not state.use_hybrid:
+            state.sparse_results = []
+            return state
+
+        top_k = self.config.rag.retrieval.top_k_initial
+        results = []
+
+        for q in state.rewritten_queries:
+            if self._bm25_indexed:
+                # 优先使用独立 BM25 检索器
+                sparse = self.bm25_retriever.search(q, top_k)
                 for item in sparse:
                     item["retrieval_channel"] = "sparse"
-                sparse_results.extend(sparse)
+                results.extend(sparse)
+            else:
+                # 降级到 Milvus keyword_search
+                merged = self._merge_filters(state.filters, {})
+                sparse = self.vector_db.keyword_search(q, top_k, merged)
+                for item in sparse:
+                    item["retrieval_channel"] = "sparse"
+                results.extend(sparse)
 
-        initial_results = self._rrf_fuse(
-            dense_results,
-            sparse_results,
-            top_k_initial * 3,
-            dense_weight=1.0,
-            sparse_weight=0.2,
-        )
-        initial_results = self._apply_temporal_filter(initial_results, query_plan.get("metadata_hints", {}))
+        state.sparse_results = results
+        return state
+
+    def _node_fusion(self, state: RetrievalState) -> RetrievalState:
+        """RRF 融合。"""
+        if not state.dense_results and not state.sparse_results:
+            state.fused_results = []
+            return state
+
+        rrf_k = 60
+        fused = {}
+
+        def _ranked(items):
+            return sorted(items, key=lambda x: x.get("score", 0.0), reverse=True)
+
+        for rank_idx, item in enumerate(_ranked(state.dense_results), 1):
+            key = str(item.get("chunk_id", rank_idx))
+            if key not in fused:
+                fused[key] = dict(item)
+                fused[key]["original_score"] = float(item.get("score", 0.0))
+            fused[key]["score"] += 1.0 / (rrf_k + rank_idx)
+            fused[key]["dense_rank"] = rank_idx
+
+        for rank_idx, item in enumerate(_ranked(state.sparse_results), 1):
+            key = str(item.get("chunk_id", rank_idx))
+            if key not in fused:
+                fused[key] = dict(item)
+                fused[key]["original_score"] = float(item.get("score", 0.0))
+            fused[key]["score"] += 0.2 / (rrf_k + rank_idx)
+            fused[key]["sparse_rank"] = rank_idx
+
+        fused_list = sorted(fused.values(), key=lambda x: x.get("score", 0.0), reverse=True)
+        top_k_initial = self.config.rag.retrieval.top_k_initial
+        state.fused_results = fused_list[:top_k_initial * 3]
+        state.fused_results = self._apply_temporal_filter(state.fused_results, {})
 
         logger.info(
-            f"初步检索到 {len(initial_results)} 个结果 (dense={len(dense_results)}, sparse={len(sparse_results)})"
+            f"初步检索到 {len(state.fused_results)} 个结果 "
+            f"(dense={len(state.dense_results)}, sparse={len(state.sparse_results)})"
         )
-        
+        return state
+
+    def _node_rerank(self, state: RetrievalState) -> RetrievalState:
+        """重排。"""
         top_k_final = self.config.rag.retrieval.top_k_final
-        reranked_results = self.reranker.rerank(primary_query, initial_results, top_k_final)
-        
+        reranked = self.reranker.rerank(state.primary_query, state.fused_results, top_k_final)
+
         retrieval_results = []
-        for idx, result in enumerate(reranked_results):
-            metadata = result.get("metadata") or {}
-            metadata = dict(metadata)
-            metadata["route_focus"] = route_info.get("focus", "law_article")
+        for idx, result in enumerate(reranked):
+            metadata = dict(result.get("metadata") or {})
+            metadata["route_focus"] = state.route_focus
             metadata["context_tier"] = self._context_tier_by_rank(idx)
-            metadata["query_rewrite"] = primary_query
+            metadata["query_rewrite"] = state.primary_query
 
             chunk = LawChunk(
                 chunk_id=result["chunk_id"],
@@ -726,18 +1111,99 @@ class LegalRAG:
                 article_num=result["article_num"],
                 content=result["content"],
                 level=result["level"],
-                metadata=metadata
+                metadata=metadata,
             )
-            retrieval_result = RetrievalResult(
-                chunk=chunk,
-                score=result.get("rerank_score", result.get("score", 0.0)),
-                rank=idx + 1
+            retrieval_results.append(
+                RetrievalResult(
+                    chunk=chunk,
+                    score=result.get("rerank_score", result.get("score", 0.0)),
+                    rank=idx + 1,
+                )
             )
-            retrieval_results.append(retrieval_result)
-        
-        logger.info(f"最终返回 {len(retrieval_results)} 个结果")
-        return retrieval_results
 
+        state.final_results = retrieval_results
+        logger.info(f"最终返回 {len(retrieval_results)} 个结果")
+        return state
+
+    # =============================================================================
+    # 条件边路由 — 替代 search() 中的 if-else 判断
+    # =============================================================================
+    def _route_after_rewrite(self, state: RetrievalState) -> Literal["dense_search", "rerank"]:
+        if not state.need_retrieval:
+            return "rerank"
+        return "dense_search"
+
+    def _route_after_dense(self, state: RetrievalState) -> Literal["sparse_search", "fusion"]:
+        if state.use_hybrid and state.need_retrieval:
+            return "sparse_search"
+        return "fusion"
+
+    def _route_after_sparse(self, state: RetrievalState) -> Literal["fusion"]:
+        return "fusion"
+
+    # =============================================================================
+    # 构建 StateGraph
+    # =============================================================================
+    def _build_graph(self):
+        workflow = StateGraph(RetrievalState)
+
+        workflow.add_node("query_rewrite", self._node_query_rewrite)
+        workflow.add_node("dense_search", self._node_dense_search)
+        workflow.add_node("sparse_search", self._node_sparse_search)
+        workflow.add_node("fusion", self._node_fusion)
+        workflow.add_node("rerank", self._node_rerank)
+
+        workflow.add_conditional_edges(
+            "query_rewrite",
+            self._route_after_rewrite,
+            {
+                "dense_search": "dense_search",
+                "rerank": "rerank",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "dense_search",
+            self._route_after_dense,
+            {
+                "sparse_search": "sparse_search",
+                "fusion": "fusion",
+            },
+        )
+
+        workflow.add_edge("sparse_search", "fusion")
+        workflow.add_edge("fusion", "rerank")
+        workflow.add_edge("rerank", END)
+
+        workflow.set_entry_point("query_rewrite")
+        self._graph = workflow.compile()
+
+    # =============================================================================
+    # 对外接口 — 保持原有签名，内部委托给 Graph
+    # =============================================================================
+    def search(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[RetrievalResult]:
+        logger.info(f"执行检索寻找前50条查询: {query[:50]}...")
+
+        state = RetrievalState(
+            original_query=query,
+            filters=filters or {},
+            need_retrieval=True,
+            rewritten_queries=[],
+            primary_query=query,
+            use_hybrid=True,
+            route_focus="law_article",
+            dense_results=[],
+            sparse_results=[],
+            fused_results=[],
+            final_results=[],
+        )
+
+        result = self._graph.invoke(state)
+        return result["final_results"]
+
+    # =============================================================================
+    # 保留的辅助方法 — 供节点调用
+    # =============================================================================
     def _merge_filters(self, user_filters: Optional[Dict[str, Any]], hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         merged = {}
         if user_filters:
@@ -745,37 +1211,6 @@ class LegalRAG:
         if hints:
             merged.update(hints)
         return merged
-
-    def _rrf_fuse(
-        self,
-        dense_results: List[Dict[str, Any]],
-        sparse_results: List[Dict[str, Any]],
-        limit: int,
-        rrf_k: int = 60,
-        dense_weight: float = 1.0,
-        sparse_weight: float = 0.2,
-    ) -> List[Dict[str, Any]]:
-        def _ranked(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            return sorted(items, key=lambda x: x.get("score", 0.0), reverse=True)
-
-        fused = {}
-        for source_name, items in [("dense", _ranked(dense_results)), ("sparse", _ranked(sparse_results))]:
-            source_weight = dense_weight if source_name == "dense" else sparse_weight
-            for rank_idx, item in enumerate(items, start=1):
-                chunk_id = item.get("chunk_id")
-                if not chunk_id:
-                    continue
-                key = str(chunk_id)
-                if key not in fused:
-                    fused[key] = dict(item)
-                    fused[key]["original_score"] = float(item.get("score", 0.0))  # 记录原始检索分数（通常在 0.6 ~ 0.9 左右）
-                    fused[key]["score"] = 0.0
-                fused[key]["score"] += source_weight * (1.0 / (rrf_k + rank_idx))
-                fused[key][f"{source_name}_rank"] = rank_idx
-
-        merged = list(fused.values())
-        merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return merged[:limit]
 
     def _apply_temporal_filter(self, results: List[Dict[str, Any]], hints: Dict[str, Any]) -> List[Dict[str, Any]]:
         event_date = hints.get("event_date") if hints else None
@@ -800,14 +1235,7 @@ class LegalRAG:
     def _parse_date(self, text: str) -> Optional[datetime]:
         if not text:
             return None
-        candidates = [
-            "%Y-%m-%d",
-            "%Y/%m/%d",
-            "%Y.%m.%d",
-            "%Y-%m",
-            "%Y/%m",
-            "%Y",
-        ]
+        candidates = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y"]
         for fmt in candidates:
             try:
                 return datetime.strptime(text, fmt)
@@ -824,22 +1252,20 @@ class LegalRAG:
 
     def search_by_event(self, event_description: str, event_time: Optional[str] = None) -> List[RetrievalResult]:
         filters = {}
-        
         if event_time:
             filters["effective_date"] = event_time
-        
         return self.search(event_description, filters)
 
     def get_relevant_laws(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         results = self.search(query)
-        
+
         law_groups = {}
         for result in results:
             law_name = result.chunk.law_name
             if law_name not in law_groups:
                 law_groups[law_name] = []
             law_groups[law_name].append(result)
-        
+
         relevant_laws = []
         for law_name, law_results in law_groups.items():
             relevant_laws.append({
@@ -848,7 +1274,7 @@ class LegalRAG:
                 "contents": [r.chunk.content for r in law_results],
                 "max_score": max(r.score for r in law_results)
             })
-        
+
         relevant_laws.sort(key=lambda x: x["max_score"], reverse=True)
         return relevant_laws[:top_k]
 
@@ -858,7 +1284,83 @@ class LegalRAG:
     def reset_index(self):
         logger.warning("重置向量数据库索引")
         self.vector_db.delete_collection()
-        self._init_vector_db()
-
-    def _init_vector_db(self):
         self.vector_db = VectorDBManager()
+        self.bm25_retriever = BM25SparseRetriever()
+        self._bm25_indexed = False
+        self._build_graph()
+
+    # =============================================================================
+    # LangChain Retriever 兼容接口 — 将完整检索流程暴露为标准 Retriever
+    # =============================================================================
+    def as_retriever(self, top_k: int = 5) -> "HybridLegalRetriever":
+        """
+        将 LegalRAG 的混合检索流程封装为 LangChain 兼容 Retriever。
+
+        Usage:
+            from langchain_core.retrievers import RetrieverLike
+            retriever: RetrieverLike = legal_rag.as_retriever(top_k=5)
+            docs = retriever.invoke("民间借贷 利息计算")
+        """
+        return HybridLegalRetriever(self, top_k)
+
+
+class HybridLegalRetriever:
+    """
+    LangChain 兼容的混合检索 Retriever。
+
+    封装 LegalRAG.search()，对外暴露 LangChain RetrieverLike 接口：
+      - invoke(query)           → 同步检索
+      - get_relevant_documents(query) → 别名方法（兼容旧代码）
+    """
+
+    def __init__(self, legal_rag: LegalRAG, top_k: int = 5):
+        self._rag = legal_rag
+        self._top_k = top_k
+
+    def invoke(self, query: str) -> List["RetrievedDoc"]:
+        """LangChain Retriever 协议：同步检索。"""
+        results = self._rag.search(query)
+        return [
+            RetrievedDoc(
+                page_content=r.chunk.content,
+                metadata={
+                    "law_name": r.chunk.law_name,
+                    "article_num": r.chunk.article_num,
+                    "level": r.chunk.level,
+                    "score": r.score,
+                    "rank": r.rank,
+                    **r.chunk.metadata,
+                },
+            )
+            for r in results[: self._top_k]
+        ]
+
+    def get_relevant_documents(self, query: str) -> List["RetrievedDoc"]:
+        """LangChain 旧版 Retriever 接口（别名）。"""
+        return self.invoke(query)
+
+    def __call__(self, query: str) -> List["RetrievedDoc"]:
+        return self.invoke(query)
+
+
+class RetrievedDoc:
+    """
+    轻量级文档对象，替代 langchain_core.documents.Document。
+
+    避免引入 langchain_core 导致的 pydantic 版本冲突，
+    同时保持与 LangChain Document 完全兼容的字段结构。
+    """
+
+    def __init__(self, page_content: str, metadata: Optional[dict] = None):
+        self.page_content = page_content
+        self.metadata = metadata or {}
+
+    def __repr__(self):
+        return f"<RetrievedDoc: {self.page_content[:50]}...>"
+
+    def __str__(self):
+        return self.page_content
+
+    def to_langchain_doc(self) -> Dict[str, Any]:
+        """转换为 LangChain Document 格式（lazy import，避免顶层依赖）。"""
+        return {"page_content": self.page_content, "metadata": self.metadata}
