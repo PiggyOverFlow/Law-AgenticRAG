@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional, Callable, Literal
 from dataclasses import dataclass, field
 import logging
+import requests
 
 from config import get_config
 from src.models.legal_event import LegalEvent, CaseFacts
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 class AgentState(dict):
     """LegalAgent 的状态结构，LangGraph 在节点间传递此字典。"""
     task: str = ""
-    case_facts: str = ""
+    case_facts: Any = ""
     document_type: str = ""
     user_request: str = ""
     max_iterations: int = 5
@@ -270,11 +271,7 @@ class LegalAgent:
         tool = self.tools["fact_extraction"]
         case_facts = state.get("case_facts")
         if hasattr(case_facts, "evidence_summary"):
-            extracted = {
-                "events_count": len(case_facts.events),
-                "evidence_summary": case_facts.evidence_summary,
-                "key_disputes": case_facts.key_disputes,
-            }
+            extracted = tool(case_facts=case_facts)
         else:
             extracted = {}
         state["extracted_facts"] = extracted
@@ -283,9 +280,22 @@ class LegalAgent:
 
     def _node_rag_search(self, state: AgentState) -> AgentState:
         """检索法律法规。"""
-        query = state.get("case_facts") or ""
+        facts = state.get("extracted_facts", {})
+        evidence_summary = facts.get("evidence_summary", "")
+        key_disputes = "；".join(facts.get("key_disputes", [])[:5]) if facts.get("key_disputes") else ""
+        query = " ".join([x for x in [evidence_summary, key_disputes] if x]).strip()
         if state.get("user_request"):
-            query = f"{query} {state['user_request']}"
+            query = f"{query} {state['user_request']}".strip()
+
+        if not query:
+            query = state.get("document_type", "法律文书")
+
+        if not self.rag_tool or not self.rag_tool.rag:
+            logger.warning("RAG 工具未初始化，跳过法条检索")
+            state["retrieved_laws"] = []
+            state["observations"].append({"tool": "rag_search", "result": [], "warning": "rag_not_initialized"})
+            return state
+
         results = self.rag_tool.rag.search(query)
         retrieved = [
             {
@@ -311,35 +321,16 @@ class LegalAgent:
     def _node_generate(self, state: AgentState) -> AgentState:
         """综合观察结果生成最终文书。"""
         laws = state.get("retrieved_laws", [])
-        template = state.get("template", "")
-        facts = state.get("extracted_facts", {})
-        doc_type = state.get("document_type", "")
-
-        if laws:
-            lines = []
-            for idx, law in enumerate(laws, 1):
-                lines.append(
-                    f"{idx}. {law['law_name']} {law['article_num']} | 分数: {law['score']:.4f}\n   {law['content']}"
-                )
-            law_context = "\n".join(lines)
-        else:
-            law_context = "未找到相关法律条文"
-
-        prompt = f"""根据以下信息生成法律文书：
-
-文书类型：{doc_type}
-
-案件事实：
-{facts.get('evidence_summary', '')}
-
-相关法条：
-{law_context}
-
-文书模板：
-{template}
-
-请根据模板格式，结合案件事实和相关法条，生成完整的法律文书。"""
-
+        prompt = self._build_generation_prompt(
+            {
+                "document_type": state.get("document_type", ""),
+                "user_request": state.get("user_request", ""),
+                "extracted_facts": state.get("extracted_facts", {}),
+                "template": state.get("template", ""),
+                "case_facts": state.get("case_facts"),
+            },
+            laws,
+        )
         state["generated_document"] = self._generate_document(prompt)
         return state
 
@@ -417,7 +408,7 @@ class LegalAgent:
         """执行 Agent，外部调用入口。"""
         state = AgentState(
             task=context.get("task", ""),
-            case_facts=str(context.get("case_facts", "")),
+            case_facts=context.get("case_facts", ""),
             document_type=context.get("document_type", "起诉书"),
             user_request=context.get("user_request", ""),
             max_iterations=context.get("max_iterations", self.config.agent.max_iterations),
@@ -448,11 +439,125 @@ class LegalAgent:
     def generate(self, context: Dict[str, Any], observations: List[Observation]) -> str:
         return ""
 
-    def _build_generation_prompt(self, context: Dict[str, Any], observations: List[Observation]) -> str:
-        return ""
+    def _build_generation_prompt(self, context: Dict[str, Any], laws: List[Dict[str, Any]]) -> str:
+        doc_type = context.get("document_type", "法律文书")
+        user_request = context.get("user_request", "")
+        template = context.get("template", "")
+        facts = context.get("extracted_facts", {})
+        case_facts = context.get("case_facts")
+
+        fact_timeline = []
+        if hasattr(case_facts, "events") and case_facts.events:
+            for idx, event in enumerate(case_facts.events[:20], 1):
+                event_line = (
+                    f"{idx}. 时间:{event.time or '未知'}；地点:{event.place or '未知'}；"
+                    f"起因:{event.cause or '未知'}；经过:{event.process or '未知'}；"
+                    f"结果:{event.result or '未知'}"
+                )
+                fact_timeline.append(event_line)
+
+        law_context = self._format_law_results(laws)
+        evidence_summary = facts.get("evidence_summary", "")
+        key_disputes = "\n".join([f"- {d}" for d in facts.get("key_disputes", [])])
+
+        return f"""你是一名资深中国执业律师，请根据给定信息生成{doc_type}。
+
+硬性要求：
+1. 只输出最终文书正文，不要解释过程。
+2. 严禁虚构当事人身份信息、金额、时间、地点；缺失信息请用“待补充”。
+3. 法律依据必须来自提供的“相关法条”，并在“事实与理由”中结合案情论证。
+4. 格式尽量贴合文书模板，结构完整、用语规范。
+
+文书类型：{doc_type}
+用户诉求：{user_request or '无'}
+
+证据摘要：
+{evidence_summary or '无'}
+
+争议焦点：
+{key_disputes or '无'}
+
+事实时间线：
+{chr(10).join(fact_timeline) if fact_timeline else '无'}
+
+相关法条：
+{law_context}
+
+文书模板：
+{template or '无模板'}
+"""
 
     def _format_law_results(self, results: List[Dict[str, Any]]) -> str:
-        return "未找到相关法律条文"
+        if not results:
+            return "未找到相关法律条文"
+
+        lines = []
+        for idx, law in enumerate(results[:8], 1):
+            lines.append(
+                f"{idx}. {law.get('law_name', '未知法律')} {law.get('article_num', '')}"
+                f" | 分数: {float(law.get('score', 0.0)):.4f}\n"
+                f"   {law.get('content', '')}"
+            )
+        return "\n".join(lines)
+
+    def _build_fallback_document(self, prompt: str) -> str:
+        return (
+            "# 法律文书（生成降级结果）\n\n"
+            "模型调用失败，以下为系统根据现有证据与模板生成的草稿，请人工完善后使用。\n\n"
+            "## 事实与理由\n"
+            "待补充：请根据证据材料补充事实经过、争议焦点和法律依据。\n\n"
+            "## 诉讼请求/申请事项\n"
+            "待补充：请根据案件目标填写具体请求。\n\n"
+            "## 参考上下文\n"
+            f"{prompt[:2000]}"
+        )
 
     def _generate_document(self, prompt: str) -> str:
-        return "生成的法律文书内容"
+        llm_cfg = self.config.llm
+        base_url = str(llm_cfg.base_url).rstrip("/")
+        api_key = llm_cfg.api_key
+        model = llm_cfg.primary_model
+
+        if not base_url or not model or not api_key or str(api_key).startswith("${"):
+            logger.warning("LLM 配置不完整，返回降级草稿")
+            return self._build_fallback_document(prompt)
+
+        payload = {
+            "model": model,
+            "temperature": llm_cfg.temperature,
+            "max_tokens": llm_cfg.max_tokens,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是中国法律文书写作助手。必须严格基于输入事实与法条生成，输出中文正式文书正文。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=getattr(self.config.performance, "request_timeout", 120),
+            )
+            response.raise_for_status()
+
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                logger.warning("LLM 返回为空，返回降级草稿")
+                return self._build_fallback_document(prompt)
+            return content
+        except Exception as e:
+            logger.error(f"文书生成调用失败: {e}")
+            return self._build_fallback_document(prompt)

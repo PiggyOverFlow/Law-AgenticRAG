@@ -22,6 +22,7 @@ class LawRAG:
         self.agent = LegalAgent()
         self.agent.set_rag(self.rag)
         self.document_generator = DocumentGenerator()
+        self.document_generator.agent.set_rag(self.rag)
         self.evaluator = EvaluationFramework()
         
         logger = logging.getLogger(__name__)
@@ -144,7 +145,30 @@ def main():
         lawrag.build_index(limit=args.limit)
     
     elif args.command == "generate":
-        evidence_files = args.evidence.split(",")
+        evidence_files = []
+        for raw_path in args.evidence.split(","):
+            path_str = raw_path.strip()
+            if not path_str:
+                continue
+
+            input_path = Path(path_str)
+            if input_path.exists():
+                evidence_files.append(str(input_path))
+                continue
+
+            fallback_path = Path("dataset/evident") / path_str
+            if fallback_path.exists():
+                evidence_files.append(str(fallback_path))
+                continue
+
+            raise FileNotFoundError(
+                f"证据文件不存在: {path_str}。请使用相对项目根目录的路径，"
+                f"例如 dataset/evident/{path_str}"
+            )
+
+        if not evidence_files:
+            raise ValueError("--evidence 不能为空，请至少提供一个证据文件路径")
+
         case_facts = lawrag.parse_evidence(evidence_files)
         
         content = lawrag.generate_document(
