@@ -47,6 +47,9 @@ class RetrievalConfig:
     top_k_final: int
     chunk_size: int
     chunk_overlap: int
+    agentic_max_rounds: int = 3
+    agentic_min_rounds: int = 1
+    min_results_to_stop: int = 5
 
 
 @dataclass
@@ -127,8 +130,8 @@ class LLMJudgeConfig:
     checks: list
     api_key: str = ""
     base_url: str = ""
-    temperature: float = 0.3
-    max_tokens: int = 4096
+    temperature: float = 0.6
+    max_tokens: int = 8192
     timeout: int = 60
 
 

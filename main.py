@@ -79,10 +79,17 @@ class LawRAG:
                 "law_name": r.chunk.law_name,
                 "article_num": r.chunk.article_num,
                 "content": r.chunk.content,
-                "score": r.score
+                "score": r.score,
+                "distance": r.score,
+                "keyword_hits": r.chunk.metadata.get("keyword_hits", []),
+                "effective_keywords": r.chunk.metadata.get("effective_keywords", []),
+                "keyword_idf": r.chunk.metadata.get("keyword_idf", {}),
             }
             for r in results[:top_k]
         ]
+
+    def answer_query(self, query: str) -> dict:
+        return self.rag.answer_with_citations(query)
 
     def evaluate_document(
         self,
@@ -126,6 +133,9 @@ def main():
     search_parser = subparsers.add_parser("search", help="检索法律法规")
     search_parser.add_argument("--query", required=True, help="检索查询")
     search_parser.add_argument("--top-k", type=int, default=5, help="返回结果数量")
+
+    ask_parser = subparsers.add_parser("ask", help="基于法条证据回答并给出引用")
+    ask_parser.add_argument("--query", required=True, help="用户问题")
     
     evaluate_parser = subparsers.add_parser("evaluate", help="评估文书质量")
     evaluate_parser.add_argument("--document", required=True, help="生成的文书路径")
@@ -187,8 +197,39 @@ def main():
         
         for idx, result in enumerate(results, 1):
             print(f"\n{idx}. {result['law_name']} {result['article_num']}")
-            print(f"   相关度: {result['score']:.4f}")
+            print(f"   距离: {result['distance']:.4f} (越小越相关)")
+            if result.get("keyword_hits"):
+                print(f"   关键词命中: {', '.join(result['keyword_hits'])}")
+            if result.get("effective_keywords"):
+                print(f"   重排有效词: {', '.join(result['effective_keywords'])}")
+            if result.get("keyword_idf"):
+                idf_text = ", ".join([f"{k}:{v:.2f}" for k, v in result["keyword_idf"].items()])
+                print(f"   命中词区分度(IDF): {idf_text}")
             print(f"   内容: {result['content'][:200]}...")
+
+    elif args.command == "ask":
+        result = lawrag.answer_query(args.query)
+
+        print("回答:")
+        print(result.get("answer", ""))
+
+        citations = result.get("citations", [])
+        if citations:
+            print("\n引用:")
+            for item in citations:
+                print(
+                    f"[{item['id']}] {item['law_name']} {item['article_num']} "
+                    f"(距离={item['distance']:.4f})"
+                )
+
+        trace = result.get("trace", [])
+        if trace:
+            print("\n检索轨迹:")
+            for step in trace:
+                print(
+                    f"- 第{step['round_index']}轮 | query={step['query_used']} "
+                    f"| keywords={step['keywords']} | hits={step['vector_hits']}->{step['kept_hits']}"
+                )
     
     elif args.command == "evaluate":
         with open(args.document, "r", encoding="utf-8") as f:

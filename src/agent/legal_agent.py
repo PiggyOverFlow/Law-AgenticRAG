@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional, Callable, Literal
 from dataclasses import dataclass, field
 import logging
 import requests
+import re
 
 from config import get_config
 from src.models.legal_event import LegalEvent, CaseFacts
@@ -31,6 +32,7 @@ class AgentState(dict):
 
     # 中间结果
     retrieved_laws: list[dict] = field(default_factory=list)
+    law_filter_report: dict = field(default_factory=dict)
     template: str = ""
     extracted_facts: dict = field(default_factory=dict)
 
@@ -279,36 +281,316 @@ class LegalAgent:
         return state
 
     def _node_rag_search(self, state: AgentState) -> AgentState:
-        """检索法律法规。"""
-        facts = state.get("extracted_facts", {})
-        evidence_summary = facts.get("evidence_summary", "")
-        key_disputes = "；".join(facts.get("key_disputes", [])[:5]) if facts.get("key_disputes") else ""
-        query = " ".join([x for x in [evidence_summary, key_disputes] if x]).strip()
-        if state.get("user_request"):
-            query = f"{query} {state['user_request']}".strip()
-
-        if not query:
-            query = state.get("document_type", "法律文书")
-
+        """检索法律法规（Agentic-RAG：多轮查询 + 回退策略）。"""
         if not self.rag_tool or not self.rag_tool.rag:
             logger.warning("RAG 工具未初始化，跳过法条检索")
             state["retrieved_laws"] = []
             state["observations"].append({"tool": "rag_search", "result": [], "warning": "rag_not_initialized"})
             return state
 
-        results = self.rag_tool.rag.search(query)
-        retrieved = [
-            {
-                "law_name": r.chunk.law_name,
-                "article_num": r.chunk.article_num,
-                "content": r.chunk.content,
-                "score": r.score,
-            }
-            for r in results
-        ]
+        queries = self._build_agentic_rag_queries(state)
+        retrieval_cfg = getattr(self.config.rag, "retrieval", None)
+        target_results = max(1, int(getattr(retrieval_cfg, "top_k_final", 5)))
+        min_attempts = max(1, int(getattr(retrieval_cfg, "agentic_min_rounds", 1)))
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        attempts: List[Dict[str, Any]] = []
+
+        for idx, query in enumerate(queries[:8], 1):
+            if not query.strip():
+                continue
+
+            try:
+                results = self.rag_tool(query=query)
+            except Exception as e:
+                logger.warning(f"RAG 第{idx}轮检索失败: {e}")
+                attempts.append({"attempt": idx, "query": query, "hits": 0, "error": str(e)})
+                continue
+
+            hits = 0
+            for r in results:
+                key = f"{r.get('law_name', '')}::{r.get('article_num', '')}"
+                old = dedup.get(key)
+                if old is None or float(r.get("score", 9999.0)) < float(old.get("score", 9999.0)):
+                    dedup[key] = r
+                hits += 1
+
+            attempts.append({"attempt": idx, "query": query, "hits": hits})
+            if len(dedup) >= target_results and idx >= min_attempts:
+                break
+
+        retrieved = sorted(dedup.values(), key=lambda x: float(x.get("score", 9999.0)))[:target_results]
+
+        logger.info(f"Agentic-RAG 检索轮次: {len(attempts)}，命中条文: {len(retrieved)}")
         state["retrieved_laws"] = retrieved
-        state["observations"].append({"tool": "rag_search", "result": retrieved})
+        state["observations"].append({
+            "tool": "rag_search",
+            "result": retrieved,
+            "agentic_attempts": attempts,
+        })
         return state
+
+    def _node_evidence_filter(self, state: AgentState) -> AgentState:
+        """对候选法条做证据级筛选，抑制错引与长上下文膨胀。"""
+        laws = state.get("retrieved_laws", []) or []
+        if not laws:
+            state["law_filter_report"] = {"candidates": 0, "kept": 0}
+            state["observations"].append(
+                {"tool": "evidence_filter", "result": [], "warning": "no_candidates"}
+            )
+            return state
+
+        retrieval_cfg = getattr(self.config.rag, "retrieval", None)
+        max_laws = max(1, int(getattr(retrieval_cfg, "top_k_final", 5)))
+        min_support = float(getattr(retrieval_cfg, "evidence_filter_min_score", 0.18))
+        total_char_budget = max(600, int(getattr(retrieval_cfg, "context_char_budget", 2600)))
+        per_law_char_budget = max(120, int(getattr(retrieval_cfg, "per_law_char_budget", 700)))
+
+        signals = self._build_evidence_signals(state)
+        ranked = [self._score_law_by_evidence(item, signals) for item in laws]
+        ranked.sort(
+            key=lambda x: (-float(x.get("evidence_support_score", 0.0)), float(x.get("score", 9999.0)))
+        )
+
+        kept = [item for item in ranked if float(item.get("evidence_support_score", 0.0)) >= min_support]
+        if not kept:
+            kept = ranked[: max(1, min(3, len(ranked)))]
+
+        compressed: List[Dict[str, Any]] = []
+        used_chars = 0
+        for law in kept:
+            if len(compressed) >= max_laws:
+                break
+
+            remaining = total_char_budget - used_chars
+            if remaining <= 80:
+                break
+
+            clipped = self._clip_text(
+                str(law.get("content", "")),
+                min(per_law_char_budget, remaining),
+            )
+
+            item = dict(law)
+            item["content"] = clipped
+
+            metadata = dict(item.get("metadata") or {})
+            metadata.update(
+                {
+                    "evidence_support_score": item.get("evidence_support_score", 0.0),
+                    "evidence_hits": item.get("evidence_hits", []),
+                    "evidence_filter_applied": True,
+                }
+            )
+            item["metadata"] = metadata
+
+            used_chars += len(clipped)
+            compressed.append(item)
+
+        avg_support = (
+            sum(float(x.get("evidence_support_score", 0.0)) for x in compressed) / len(compressed)
+            if compressed
+            else 0.0
+        )
+        report = {
+            "candidates": len(laws),
+            "kept": len(compressed),
+            "dropped": max(0, len(laws) - len(compressed)),
+            "signals": len(signals),
+            "avg_support": round(avg_support, 4),
+            "char_budget": total_char_budget,
+            "char_used": used_chars,
+        }
+
+        state["retrieved_laws"] = compressed
+        state["law_filter_report"] = report
+        state["observations"].append(
+            {
+                "tool": "evidence_filter",
+                "result": compressed,
+                "report": report,
+            }
+        )
+
+        logger.info(
+            "证据级筛选完成，候选: %s，保留: %s，平均支持分: %.3f，字符预算: %s/%s",
+            report["candidates"],
+            report["kept"],
+            report["avg_support"],
+            report["char_used"],
+            report["char_budget"],
+        )
+        return state
+
+    def _build_agentic_rag_queries(self, state: AgentState) -> List[str]:
+        facts = state.get("extracted_facts", {})
+        evidence_summary = self._sanitize_evidence_summary(facts.get("evidence_summary", ""))
+        disputes = facts.get("key_disputes", []) or []
+        user_request = (state.get("user_request") or "").strip()
+        doc_type = (state.get("document_type") or "法律文书").strip()
+
+        base_candidates = [
+            " ".join([user_request, "；".join(disputes[:4])]).strip(),
+            " ".join([user_request, evidence_summary[:300]]).strip(),
+            " ".join(["；".join(disputes[:6]), evidence_summary[:280]]).strip(),
+            user_request,
+            evidence_summary[:320],
+        ]
+
+        expanded: List[str] = []
+        for q in base_candidates:
+            if not q:
+                continue
+            expanded.append(q)
+            expanded.append(f"{q} 相关法律依据")
+            expanded.append(f"{q} 司法解释")
+
+        # 当语义过于个案化导致召回为 0 时，追加案由级兜底检索。
+        domain_fallback = self._build_domain_fallback_queries(user_request, disputes, doc_type)
+        expanded.extend(domain_fallback)
+
+        unique = []
+        seen = set()
+        for q in expanded:
+            normalized = re.sub(r"\s+", " ", q).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(normalized)
+
+        return unique
+
+    def _sanitize_evidence_summary(self, summary: str) -> str:
+        if not summary:
+            return ""
+        lines = []
+        for line in str(summary).splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("文件:") or s.startswith("类型:"):
+                continue
+            lines.append(s)
+        return " ".join(lines)
+
+    def _build_domain_fallback_queries(self, user_request: str, disputes: List[str], doc_type: str) -> List[str]:
+        seed = " ".join([user_request, "；".join(disputes[:4])])
+
+        if any(k in seed for k in ["借款", "民间借贷", "本金", "利息", "乙公司", "追加"]):
+            return [
+                "民间借贷 起诉书 共同被告 追加被告 法律依据",
+                "民法典 借款合同 还本付息 逾期利息",
+                "民间借贷司法解释 共同债务 追加被告",
+            ]
+
+        if any(k in seed for k in ["劳动", "赔偿金", "解除劳动合同"]):
+            return [
+                "劳动争议 违法解除 劳动合同 赔偿金 法律依据",
+                "劳动合同法 解除劳动合同 经济补偿",
+            ]
+
+        return [
+            f"{doc_type} 常用法律依据",
+            "民事诉讼 起诉 条件 法律依据",
+        ]
+
+    def _build_evidence_signals(self, state: AgentState) -> List[str]:
+        facts = state.get("extracted_facts", {}) or {}
+        summary = self._sanitize_evidence_summary(facts.get("evidence_summary", ""))
+        disputes = facts.get("key_disputes", []) or []
+        timeline = facts.get("timeline", []) or []
+
+        parts = [
+            str(state.get("user_request", "")),
+            summary,
+            "；".join([str(x) for x in disputes[:10]]),
+        ]
+
+        for event in timeline[:15]:
+            if not isinstance(event, dict):
+                continue
+            for key in ("cause", "process", "result", "place", "time"):
+                value = event.get(key)
+                if value:
+                    parts.append(str(value))
+
+        corpus = " ".join(parts)
+        terms = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9%]{2,16}", corpus)
+        terms.extend(
+            re.findall(
+                r"(?:20\d{2}年\d{1,2}月\d{1,2}日|\d+(?:\.\d+)?%|\d+(?:\.\d+)?(?:万|千|百)?元)",
+                corpus,
+            )
+        )
+
+        priority_words = (
+            "借款", "借贷", "利息", "本金", "违约", "逾期", "合同", "转账", "借条",
+            "赔偿", "劳动", "解除", "交通事故", "侵权", "举证", "时效",
+        )
+        for word in priority_words:
+            if word in corpus:
+                terms.append(word)
+
+        dedup: List[str] = []
+        seen = set()
+        for token in terms:
+            normalized = re.sub(r"\s+", "", str(token or "")).strip().lower()
+            if len(normalized) < 2 or len(normalized) > 20:
+                continue
+            if normalized in seen:
+                continue
+            if self._is_low_information_term(normalized):
+                continue
+            seen.add(normalized)
+            dedup.append(normalized)
+
+        return dedup[:24]
+
+    def _score_law_by_evidence(self, law: Dict[str, Any], signals: List[str]) -> Dict[str, Any]:
+        item = dict(law)
+        text_blob = " ".join(
+            [
+                str(item.get("law_name", "")),
+                str(item.get("article_num", "")),
+                str(item.get("content", "")),
+            ]
+        ).lower()
+
+        base_distance = float(item.get("score", 9999.0))
+        base_relevance = 1.0 / (1.0 + max(0.0, base_distance))
+
+        hits = []
+        for signal in signals:
+            if signal in text_blob:
+                hits.append(signal)
+            if len(hits) >= 10:
+                break
+
+        overlap = len(hits) / max(1, min(len(signals), 12))
+        context_tier = int(item.get("context_tier", 3))
+        tier_bonus = 0.08 if context_tier == 1 else 0.04 if context_tier == 2 else 0.0
+
+        support_score = min(1.0, 0.62 * base_relevance + 0.30 * overlap + tier_bonus)
+
+        item["evidence_support_score"] = round(support_score, 4)
+        item["evidence_hits"] = hits
+        return item
+
+    def _is_low_information_term(self, token: str) -> bool:
+        low_info = {
+            "法律", "法规", "条文", "规定", "相关", "问题", "情况", "处理", "如何", "怎么办",
+            "纠纷", "案件", "起诉", "诉讼", "请求", "支持", "认定", "成立", "是否", "文书",
+            "事实", "理由", "原告", "被告", "申请", "法院", "依据",
+        }
+        return token in low_info or token.isdigit()
+
+    def _clip_text(self, text: str, max_chars: int) -> str:
+        value = (text or "").strip()
+        if max_chars <= 0:
+            return ""
+        if len(value) <= max_chars:
+            return value
+        return value[: max(0, max_chars - 3)] + "..."
 
     def _node_template_retrieval(self, state: AgentState) -> AgentState:
         """获取文书模板。"""
@@ -343,8 +625,16 @@ class LegalAgent:
             return "rag_search"
         return "template_retrieval"
 
-    def _route_after_rag(self, state: AgentState) -> Literal["template_retrieval", "generate"]:
-        """RAG 检索完成后，进入模板获取或直接生成。"""
+    def _route_after_rag(self, state: AgentState) -> Literal["evidence_filter", "template_retrieval", "generate"]:
+        """RAG 检索完成后，优先进入证据级筛选，再决定模板或生成。"""
+        if state.get("retrieved_laws"):
+            return "evidence_filter"
+        if not state.get("template"):
+            return "template_retrieval"
+        return "generate"
+
+    def _route_after_filter(self, state: AgentState) -> Literal["template_retrieval", "generate"]:
+        """证据筛选后，进入模板获取或直接生成。"""
         if not state.get("template"):
             return "template_retrieval"
         return "generate"
@@ -365,6 +655,7 @@ class LegalAgent:
 
         workflow.add_node("fact_extraction", self._node_fact_extraction)
         workflow.add_node("rag_search", self._node_rag_search)
+        workflow.add_node("evidence_filter", self._node_evidence_filter)
         workflow.add_node("template_retrieval", self._node_template_retrieval)
         workflow.add_node("generate", self._node_generate)
 
@@ -381,6 +672,16 @@ class LegalAgent:
         workflow.add_conditional_edges(
             "rag_search",
             self._route_after_rag,
+            {
+                "evidence_filter": "evidence_filter",
+                "template_retrieval": "template_retrieval",
+                "generate": "generate",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "evidence_filter",
+            self._route_after_filter,
             {
                 "template_retrieval": "template_retrieval",
                 "generate": "generate",
@@ -417,6 +718,7 @@ class LegalAgent:
             actions=[],
             observations=[],
             retrieved_laws=[],
+            law_filter_report={},
             template="",
             extracted_facts={},
             generated_document=None,
@@ -467,6 +769,8 @@ class LegalAgent:
 2. 严禁虚构当事人身份信息、金额、时间、地点；缺失信息请用“待补充”。
 3. 法律依据必须来自提供的“相关法条”，并在“事实与理由”中结合案情论证。
 4. 格式尽量贴合文书模板，结构完整、用语规范。
+5. 若证据中出现明确利率/期限/本金，必须逐字沿用，不得改写为其他数值。
+6. 涉及利息请求时，必须明确写出计算基数、利率类型（月利率或年利率）、起算时间与截止时间。
 
 文书类型：{doc_type}
 用户诉求：{user_request or '无'}
@@ -491,12 +795,43 @@ class LegalAgent:
         if not results:
             return "未找到相关法律条文"
 
+        retrieval_cfg = getattr(self.config.rag, "retrieval", None)
+        max_items = max(1, int(getattr(retrieval_cfg, "top_k_final", 5)))
+        total_char_budget = max(600, int(getattr(retrieval_cfg, "context_char_budget", 2600)))
+        per_law_char_budget = max(120, int(getattr(retrieval_cfg, "per_law_char_budget", 700)))
+
         lines = []
-        for idx, law in enumerate(results[:8], 1):
+        used_chars = 0
+        for law in results[: max_items * 2]:
+            if len(lines) >= max_items:
+                break
+
+            remaining = total_char_budget - used_chars
+            if remaining <= 80:
+                break
+
+            snippet = self._clip_text(
+                str(law.get("content", "")),
+                min(per_law_char_budget, remaining),
+            )
+            used_chars += len(snippet)
+
+            support_score = law.get("evidence_support_score")
+            if support_score is None:
+                support_score = (law.get("metadata") or {}).get("evidence_support_score")
+
+            support_text = ""
+            try:
+                if support_score is not None:
+                    support_text = f" | 证据支持分: {float(support_score):.3f}"
+            except Exception:
+                support_text = ""
+
+            idx = len(lines) + 1
             lines.append(
                 f"{idx}. {law.get('law_name', '未知法律')} {law.get('article_num', '')}"
-                f" | 分数: {float(law.get('score', 0.0)):.4f}\n"
-                f"   {law.get('content', '')}"
+                f" | 距离: {float(law.get('score', 0.0)):.4f} (越小越相关)\n"
+                f"   {snippet}{support_text}"
             )
         return "\n".join(lines)
 

@@ -1,32 +1,26 @@
-from typing import List, Dict, Any, Optional, Literal, Sequence, Callable, Protocol, runtime_checkable
+from typing import List, Dict, Any, Optional, Sequence, Callable, Protocol, runtime_checkable
 import logging
 import re
+import json
 import time
 import math
-from datetime import datetime
 from dataclasses import dataclass, field
-import torch
 
-import numpy as np
+import requests
+import torch
 
 from config import get_config
 from src.rag.chunker import LawChunk, RetrievalResult
 from src.rag.vector_db import VectorDBManager
+
+
+logger = logging.getLogger(__name__)
+
+
 # =============================================================================
 # 轻量级 StateGraph 兜底实现 — 兼容 LangGraph StateGraph 接口，零外部依赖
 # =============================================================================
 class _StateGraph:
-    """
-    简化版 StateGraph，替代 langgraph.graph.StateGraph。
-
-    只实现 LegalRAG 所需的最小功能：
-      - add_node(name, func)
-      - add_edge(src, dst)
-      - add_conditional_edges(src, router, mapping)
-      - set_entry_point(name)
-      - compile() -> _CompiledGraph
-    """
-
     def __init__(self, state_class: type):
         self._state_class = state_class
         self._nodes: Dict[str, Callable] = {}
@@ -59,7 +53,6 @@ class _StateGraph:
 
 
 class _END:
-    """替代 langgraph.graph.END，标识图终点。"""
     pass
 
 
@@ -67,10 +60,6 @@ END = _END()
 
 
 class _CompiledGraph:
-    """
-    编译后的图执行器，替代 langgraph.graph.StateGraph.compile()。
-    """
-
     def __init__(
         self,
         state_class: type,
@@ -86,12 +75,6 @@ class _CompiledGraph:
         self._entry = entry
 
     def invoke(self, initial_state) -> dict:
-        """
-        按拓扑顺序执行图，替代 langgraph 的图引擎。
-
-        条件边返回的目标节点名会覆盖后续边的目的。
-        """
-        # 保持 dataclass 实例用于属性访问，末端再转 dict 返回
         if isinstance(initial_state, dict):
             state = self._state_class(**initial_state)
         else:
@@ -109,258 +92,247 @@ class _CompiledGraph:
             if node_func is None:
                 break
 
-            # 执行节点（传入 dataclass 以支持属性访问）
             result = node_func(state)
             if result is not None:
-                # 将节点返回值合并回 state（dict 和 dataclass 均支持 update）
                 if hasattr(state, "__dict__"):
                     state.__dict__.update(result if isinstance(result, dict) else {})
                 else:
                     state.update(result if isinstance(result, dict) else {})
 
-            # 条件边路由
             if current in self._conditional:
                 router, mapping = self._conditional[current]
                 next_key = router(state)
                 current = mapping.get(next_key, next_key)
                 continue
 
-            # 常规边
             next_list = self._edges.get(current, [])
             current = next_list[0] if next_list else None
 
-        # 返回 dict 格式（兼容原有接口）
         return state.__dict__ if hasattr(state, "__dict__") else dict(state)
 
 
-# 为保持外部接口一致，提供别名
 StateGraph = _StateGraph
 
 
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# LangChain 兼容 Embeddings Protocol — 替代 langchain_core.embeddings，零外部依赖
-# =============================================================================
 @runtime_checkable
 class Embeddings(Protocol):
-    """LangChain Embeddings 协议接口，与 langchain_core.embeddings.Embeddings 完全兼容。"""
-
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        """批量嵌入文档。"""
         ...
 
     def embed_query(self, text: str) -> List[float]:
-        """单条查询嵌入。"""
         ...
 
 
-# =============================================================================
-# BM25 稀疏检索器 — 基于 jieba 分词 + OKAPI BM25 公式
-# =============================================================================
-class BM25SparseRetriever:
-    """
-    纯 Python 实现的 BM25 稀疏检索器。
-
-    使用 jieba 中文分词 + OKAPI BM25 评分公式，替代传统的倒排索引。
-    可独立于向量数据库使用，作为混合检索的稀疏通道。
-    """
-
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self._corpus: List[str] = []
-        self._corpus_ids: List[str] = []
-        self._doc_len: List[int] = []
-        self._avgdl: float = 0.0
-        self._doc_freqs: Dict[str, int] = {}  # term -> doc count
-        self._num_docs: int = 0
-        self._is_indexed: bool = False
-
-    def index(self, documents: Sequence[Dict[str, Any]]) -> None:
-        """
-        为 documents 构建 BM25 索引。
-
-        Args:
-            documents: 每个元素需包含 'chunk_id' 和 'content' 字段。
-        """
-        import jieba
-
-        self._corpus = []
-        self._corpus_ids = []
-        self._doc_len = []
-        self._doc_freqs = {}
-        self._num_docs = 0
-
-        for doc in documents:
-            content = doc.get("content", "")
-            chunk_id = doc.get("chunk_id", str(len(self._corpus)))
-            tokens = [t for t in jieba.cut(content) if t.strip() and len(t) > 1]
-
-            self._corpus.append(content)
-            self._corpus_ids.append(chunk_id)
-            self._doc_len.append(len(tokens))
-
-            # 统计文档频率
-            seen = set()
-            for t in tokens:
-                if t not in seen:
-                    seen.add(t)
-                    self._doc_freqs[t] = self._doc_freqs.get(t, 0) + 1
-
-        self._num_docs = len(self._corpus)
-        self._avgdl = sum(self._doc_len) / max(self._num_docs, 1)
-        self._is_indexed = True
-        logger.info(f"BM25 索引构建完成：{self._num_docs} 篇文档，{len(self._doc_freqs)} 个词项")
-
-    def search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-        """
-        对 query 执行 BM25 检索。
-
-        Returns:
-            按 BM25 评分降序排列的结果列表，每项包含 chunk_id / score / content 等。
-        """
-        import jieba
-
-        if not self._is_indexed:
-            logger.warning("BM25 索引未构建，返回空结果")
-            return []
-
-        query_tokens = [t for t in jieba.cut(query) if t.strip() and len(t) > 1]
-        if not query_tokens:
-            return []
-
-        scores = []
-        for i, doc_tokens in enumerate(self._corpus):
-            # 重新分词（此处简化：直接用 content 重分）
-            doc_content = self._corpus[i]
-            doc_toks = [t for t in jieba.cut(doc_content) if t.strip() and len(t) > 1]
-            doc_len = self._doc_len[i]
-
-            score = self._bm25_score(query_tokens, doc_toks, doc_len)
-            if score > 0:
-                scores.append((i, score))
-
-        scores.sort(key=lambda x: x[1], reverse=True)
-        results = []
-        for idx, score in scores[:top_k]:
-            results.append({
-                "chunk_id": self._corpus_ids[idx],
-                "score": float(score),
-                "content": self._corpus[idx],
-            })
-        return results
-
-    def _bm25_score(self, query_tokens: List[str], doc_tokens: List[str], doc_len: int) -> float:
-        """OKAPI BM25 评分公式。"""
-        score = 0.0
-        freq: Dict[str, int] = {}
-        for t in doc_tokens:
-            freq[t] = freq.get(t, 0) + 1
-
-        for t in query_tokens:
-            df = self._doc_freqs.get(t, 0)
-            if df == 0:
-                continue
-            tf = freq.get(t, 0)
-            if tf == 0:
-                continue
-
-            idf = math.log((self._num_docs - df + 0.5) / (df + 0.5) + 1)
-            tf_component = (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * doc_len / max(self._avgdl, 1)))
-            score += idf * tf_component
-        return score
-
-
-# =============================================================================
-# LangGraph State — 替代 search() 中的局部变量传递
-# =============================================================================
 @dataclass
-class RetrievalState:
-    """检索流程的共享状态。"""
-    original_query: str = ""
-    filters: dict = field(default_factory=dict)
-
-    # 路由决策
-    need_retrieval: bool = True
-    rewritten_queries: list[str] = field(default_factory=list)
-    primary_query: str = ""
-    use_hybrid: bool = True
-    route_focus: str = "law_article"
-
-    # 检索结果
-    dense_results: list[dict] = field(default_factory=list)
-    sparse_results: list[dict] = field(default_factory=list)
-    fused_results: list[dict] = field(default_factory=list)
-
-    # 最终输出
-    final_results: list[RetrievalResult] = field(default_factory=list)
+class RetrievalTrace:
+    round_index: int
+    thought: str
+    query_used: str
+    rewritten_from: Optional[str] = None
+    keywords: List[str] = field(default_factory=list)
+    vector_hits: int = 0
+    kept_hits: int = 0
 
 
-class QueryRewriterRouter:
-    """检索前 Query 改写与路由决策。"""
-
+class QueryAgent:
     def __init__(self):
         self.config = get_config()
 
-    def rewrite_and_route(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        decision = self._decide_rewrite_strategy(query)
-        rewrites = self._execute_rewrite_by_decision(query, decision)
-        route = self._route_query(query, rewrites, decision)
+    def should_rewrite(self, query: str) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            return {"should_rewrite": False, "reason": "empty_query"}
 
-        metadata_hints = {}
-        law_match = re.findall(r"《([^》]+)》", query)
-        if law_match:
-            metadata_hints["law_name"] = law_match[0]
+        llm_result = self._llm_judge_query_completeness(q)
+        if llm_result is not None:
+            return llm_result
 
-        # 从 query 抽取时间信息作为后置时效过滤输入
-        year_match = re.search(r"(19\d{2}|20\d{2})年", query)
-        if year_match:
-            metadata_hints["event_date"] = f"{year_match.group(1)}-01-01"
-
-        if filters:
-            metadata_hints.update({k: v for k, v in filters.items() if v is not None})
-
+        incomplete_markers = ["这个", "这种", "该", "上述", "前述", "他", "她", "它", "怎么办", "如何处理","如何"]
+        should_rewrite = any(marker in q for marker in incomplete_markers) and len(q) <= 24
         return {
-            "original_query": query,
-            "rewrites": rewrites,
-            "rewrite_primary": rewrites[0] if rewrites else query,
-            "route": route,
-            "metadata_hints": metadata_hints,
-            "rewrite_decision": decision,
+            "should_rewrite": should_rewrite,
+            "reason": "heuristic_incomplete_query" if should_rewrite else "heuristic_complete_query",
         }
 
-    def _decide_rewrite_strategy(self, query: str) -> Dict[str, Any]:
-        """
-        Agentic 决策阶段：只负责判断“是否有必要改写”，不执行改写。
-        使用 LLM 动态判断 query 是否需要改写。
-        """
-        q = query.strip()
+    def rewrite_query(self, query: str, force: bool = False) -> str:
+        q = (query or "").strip()
         if not q:
-            return {
-                "should_rewrite": False,
-                "action": "skip_rewrite",
-                "reason": "empty_query",
-                "signals": {"agentic_decision": False},
-            }
+            return q
+
+        if not force:
+            decision = self.should_rewrite(q)
+            if not decision.get("should_rewrite", False):
+                return q
+
+        rewritten = self._llm_rewrite_query(q)
+        if rewritten:
+            return rewritten
+
+        fallback = q
+        fallback = fallback.replace("怎么办", "适用哪些法律条款以及如何处理")
+        fallback = fallback.replace("怎么判", "司法实践中如何认定与裁判")
+        if fallback == q:
+            fallback = f"{q} 相关法律条文 司法解释 适用要点"
+        return re.sub(r"\s+", " ", fallback).strip()
+
+    def extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        llm_keywords = self._llm_extract_keywords(q, max_keywords=max_keywords)
+        if llm_keywords:
+            return llm_keywords
+
+        return self._heuristic_extract_keywords(q, max_keywords=max_keywords)
+
+    def _llm_judge_query_completeness(self, query: str) -> Optional[Dict[str, Any]]:
+        prompt = (
+            "你是法律检索查询分析器。判断 query 是否信息完整，是否需要先改写。"
+            "若包含模糊指代、上下文缺失、语义过短，建议改写。"
+            "只输出 JSON：{\"should_rewrite\": bool, \"reason\": \"...\"}。\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.1, max_tokens=200)
+        if not data:
+            return None
+        return {
+            "should_rewrite": bool(data.get("should_rewrite", False)),
+            "reason": str(data.get("reason", "llm_decision")),
+        }
+
+    def _llm_rewrite_query(self, query: str) -> Optional[str]:
+        prompt = (
+            "你是法律检索改写器。将 query 改写成更完整、更可检索的一句话，"
+            "保持原意，不添加新事实。只输出 JSON：{\"rewrite\": \"...\"}。\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.2, max_tokens=256)
+        if not data:
+            return None
+        rewritten = str(data.get("rewrite", "")).strip()
+        return rewritten or None
+
+    def _llm_extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        prompt = (
+            "你是法律检索的事实要素抽取器。目标是输出高信息密度的检索要素，而不是宽泛领域词。\n"
+            "请从用户问题中抽取：\n"
+            "1) dispute_cause: 争议案由（可为空）\n"
+            "2) evidence_have: 已有证据（如转账记录、合同、病历、聊天记录）\n"
+            "3) evidence_missing: 缺失证据（如无借条、无签字）\n"
+            "4) legal_focus: 具体法律判断点（如举证责任、合同成立、过错认定、时效）\n"
+            "5) facts: 关键事实动作（如未付款、拒不履行、解除合同）\n"
+            "输出 JSON：\n"
+            "{\"dispute_cause\":\"...\",\"evidence_have\":[...],\"evidence_missing\":[...],\"legal_focus\":[...],\"facts\":[...]}\n"
+            "约束：\n"
+            "- 不要输出泛化词（如：法律、纠纷、处理、相关规定）\n"
+            "- 优先输出可区分条文的细粒度词组（2-10字）\n"
+            f"- 最多输出 {max_keywords} 个最终要素\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.1, max_tokens=256)
+        if not data:
+            return []
+
+        candidates: List[str] = []
+
+        # 兼容老格式：{"keywords": [...]} 或 {"elements": [...]}。
+        for legacy_field in ("keywords", "elements"):
+            raw = data.get(legacy_field, [])
+            if isinstance(raw, list):
+                candidates.extend([str(x) for x in raw])
+
+        cause = data.get("dispute_cause") or data.get("争议案由")
+        if isinstance(cause, str) and cause.strip():
+            candidates.append(cause)
+
+        for field in ("evidence_have", "evidence_missing", "legal_focus", "facts"):
+            value = data.get(field)
+            if isinstance(value, list):
+                candidates.extend([str(x) for x in value])
+
+        if not candidates:
+            return []
+
+        return self._post_process_terms(candidates, max_keywords=max_keywords)
+
+    def _heuristic_extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        candidates: List[str] = []
+
+        # 证据缺失/存在模式：尽量提炼成可检索的短语。
+        for m in re.finditer(r"(?:无|没有|未|缺少)([\u4e00-\u9fa5A-Za-z0-9]{2,12})", query):
+            candidates.append(f"无{m.group(1)}")
+            candidates.append(m.group(1))
+
+        for m in re.finditer(r"(?:只有|仅有|提供了|提交了|持有)([\u4e00-\u9fa5A-Za-z0-9]{2,12})", query):
+            candidates.append(m.group(1))
+
+        split_tokens = [
+            t.strip() for t in re.split(r"[\s,，。；;、:：()（）]+", query)
+            if t.strip() and len(t.strip()) >= 2
+        ]
+        candidates.extend(split_tokens)
+
+        return self._post_process_terms(candidates, max_keywords=max_keywords)
+
+    def _post_process_terms(self, terms: List[str], max_keywords: int) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+
+        for item in terms:
+            token = self._normalize_term(item)
+            if not token:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(token)
+
+        # 优先高信息密度短语：证据缺失/存在、法律动作、长度更长的短语。
+        scored = []
+        for token in cleaned:
+            score = 1.0
+            if token.startswith(("无", "未", "缺少")):
+                score += 0.5
+            if len(token) >= 4:
+                score += 0.25
+            if any(ch.isdigit() for ch in token):
+                score += 0.2
+            scored.append((score, token))
+
+        scored.sort(key=lambda x: (-x[0], -len(x[1]), x[1]))
+        return [token for _, token in scored[:max_keywords]]
+
+    def _normalize_term(self, term: str) -> str:
+        token = re.sub(r"\s+", "", str(term or "")).strip()
+        token = token.strip("，。；;、:：()（）[]【】{}\"'“”‘’")
+        if len(token) < 2 or len(token) > 14:
+            return ""
+        if self._is_low_information_token(token):
+            return ""
+        return token
+
+    def _is_low_information_token(self, token: str) -> bool:
+        low_info = {
+            "法律", "法规", "条文", "规定", "相关", "问题", "情况", "处理", "如何", "怎么办",
+            "纠纷", "案件", "起诉", "诉讼", "请求", "支持", "认定", "成立", "是否",
+        }
+        if token in low_info:
+            return True
+        # 纯数字或非常短的功能词，不作为检索要素。
+        if token.isdigit():
+            return True
+        return False
+
+    def _call_llm_json(self, prompt: str, temperature: float, max_tokens: int) -> Optional[Dict[str, Any]]:
+        llm_cfg = self.config.llm
+        base_url = str(llm_cfg.base_url).rstrip("/")
+        model = llm_cfg.primary_model
+        api_key = llm_cfg.api_key
+        if not base_url or not model or not api_key or str(api_key).startswith("${"):
+            return None
 
         try:
-            import requests
-
-            base_url = str(self.config.llm.base_url).rstrip("/")
-            model = self.config.llm.primary_model
-            api_key = self.config.llm.api_key
-
-            prompt = (
-                "你是一个法律检索系统的 Query 路由分析 Agent。\n"
-                f"分析问题：【{q}】\n"
-                "请判断该查询是否需要大模型改写。如果它是短而不依赖上下文的专业词汇（如故意伤害罪）或已经是明确完整的事实，则不需要改写 (false)，避免过度发散；"
-                "如果它包含代词、模糊指代（如“这种情况”）、省略了主体/客体，或者高度依赖上文语境才能检索，则需要改写 (true)。\n"
-                "请严格输出 JSON，包含两个字段：\n"
-                '{"should_rewrite": boolean, "reason": "分析原因"}'
-            )
             response = requests.post(
                 f"{base_url}/chat/completions",
                 headers={
@@ -369,70 +341,10 @@ class QueryRewriterRouter:
                 },
                 json={
                     "model": model,
-                    "temperature": 0.1,
-                    "max_tokens": 150,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
                     "messages": [
-                        {"role": "system", "content": "你必须且只输出标准的 JSON，不能包含别的文字。"},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-                timeout=10,
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            data = self._extract_json_object(content)
-
-            should_rewrite = bool(data.get("should_rewrite", False))
-            return {
-                "should_rewrite": should_rewrite,
-                "action": "contextual_rewrite" if should_rewrite else "skip_rewrite",
-                "reason": str(data.get("reason", "llm_decision_to_rewrite" if should_rewrite else "llm_decision_to_skip")),
-                "signals": {"agentic_decision": True},
-            }
-        except Exception as e:
-            logger.warning(f"决策 Agent 调用失败: {e}，回退到保守策略：不改写")
-            return {
-                "should_rewrite": False,
-                "action": "skip_rewrite",
-                "reason": "llm_fallback_decision",
-                "signals": {"agentic_decision": False},
-            }
-
-    def _execute_rewrite_by_decision(self, query: str, decision: Dict[str, Any]) -> List[str]:
-        if not decision.get("should_rewrite", False):
-            return [query]
-        return self._rewrite_with_llm(query)
-
-    def _rewrite_with_llm(self, query: str) -> List[str]:
-        # 优先尝试 LLM 生成多路改写，失败时回退到规则改写
-        try:
-            import requests
-
-            base_url = str(self.config.llm.base_url).rstrip("/")
-            model = self.config.llm.primary_model
-            api_key = self.config.llm.api_key
-
-            if not base_url or not model or not api_key:
-                raise ValueError("LLM 配置不完整")
-
-            prompt = (
-                "你是法律检索查询改写器。请输出严格 JSON，字段 rewrites 为字符串数组，"
-                "包含 2-4 个中文改写，覆盖：关键词扩展、法律术语标准化、同义问法。"
-                "要求：与原始语义严格等价，不得引入新的案由、争议焦点或额外事实。"
-                f"原始问题：{query}"
-            )
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0.2,
-                    "max_tokens": 500,
-                    "messages": [
-                        {"role": "system", "content": "你只输出 JSON，不要输出其他文本。"},
+                        {"role": "system", "content": "你只能输出 JSON。"},
                         {"role": "user", "content": prompt},
                     ],
                 },
@@ -440,30 +352,13 @@ class QueryRewriterRouter:
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            data = self._extract_json_object(content)
-            rewrites = [str(x).strip() for x in data.get("rewrites", []) if str(x).strip()]
-            if rewrites:
-                return list(dict.fromkeys([query] + rewrites))[:4]
+            return self._extract_json_object(content)
         except Exception as e:
-            logger.warning(f"Query 改写 LLM 调用失败，使用规则回退: {e}")
-
-        normalized = query
-        normalized = normalized.replace("怎么判", "法律责任如何认定")
-        normalized = normalized.replace("怎么办", "适用法律条款与处理路径")
-        normalized = normalized.replace("赔多少", "损害赔偿责任范围与计算标准")
-
-        fallback = [
-            query,
-            f"{query} 适用法律条款",
-            f"{normalized}",
-            f"{query} 司法解释",
-        ]
-        return list(dict.fromkeys([x.strip() for x in fallback if x.strip()]))[:4]
+            logger.warning(f"QueryAgent 调用 LLM 失败，使用规则回退: {e}")
+            return None
 
     def _extract_json_object(self, text: str) -> Dict[str, Any]:
-        import json
-
-        stripped = text.strip()
+        stripped = (text or "").strip()
         if stripped.startswith("```"):
             stripped = stripped.strip("`")
             stripped = stripped.replace("json", "", 1).strip()
@@ -471,7 +366,7 @@ class QueryRewriterRouter:
         try:
             return json.loads(stripped)
         except Exception:
-            match = re.search(r"\{[\s\S]*\}", text)
+            match = re.search(r"\{[\s\S]*\}", text or "")
             if not match:
                 return {}
             try:
@@ -479,72 +374,16 @@ class QueryRewriterRouter:
             except Exception:
                 return {}
 
-    def _route_query(
-        self,
-        original_query: str,
-        rewrites: List[str],
-        decision: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        text = " ".join([original_query] + rewrites)
-        short_query = self._is_short_query(original_query)
-        decision = decision or self._decide_rewrite_strategy(original_query)
-
-        need_retrieval = True
-        if any(x in text for x in ["你好", "谢谢", "再见", "hi", "hello"]):
-            need_retrieval = False
-
-        if any(x in text for x in ["案例", "判例", "类案", "裁判"]):
-            focus = "case"
-        elif any(x in text for x in ["事实", "证据", "时间线", "经过", "行为"]):
-            focus = "fact_extraction"
-        else:
-            focus = "law_article"
-
-        keywords = [
-            token for token in re.split(r"[\s,，。；;、:：()（）]+", original_query)
-            if token and len(token) >= 2
-        ]
-
-        return {
-            "need_retrieval": need_retrieval,
-            "focus": focus,
-            "keywords": keywords[:12],
-            "use_hybrid": True,  # 强制开启混合检索，短文本专业词更需要 BM25 的精确召回补充
-            "rewrite_mode": "contextual" if decision.get("should_rewrite") else "skip",
-            "rewrite_reason": decision.get("reason", "unknown"),
-            "rewrite_action": decision.get("action", "skip_rewrite"),
-        }
-
-    def _is_short_query(self, query: str) -> bool:
-        q = query.strip()
-        if not q:
-            return True
-
-        tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", q) if t]
-        return len(q) <= 12 or len(tokens) <= 3
-
 
 class EmbeddingModel(Embeddings):
-    """
-    嵌入模型，支持 Ollama API 和本地 HuggingFace BGE 模型。
-
-    继承 langchain_core.embeddings.Embeddings 协议，对外暴露：
-      - embed_documents(texts) -> List[List[float]]  （LangChain 标准批量接口）
-      - embed_query(text) -> List[float]            （LangChain 标准单条接口）
-
-    内部 encode() / encode_single() 保持原有 Ollama 调用逻辑不变。
-    """
-
     def __init__(self):
         self.config = get_config()
         self._init_model()
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        """LangChain Embeddings 协议：批量嵌入文档。"""
         return self.encode(list(texts))
 
     def embed_query(self, text: str) -> List[float]:
-        """LangChain Embeddings 协议：单条查询嵌入。"""
         return self.encode_single(text)
 
     def _init_model(self):
@@ -557,42 +396,31 @@ class EmbeddingModel(Embeddings):
         use_local = self.config.rag.use_local_model
         local_path = self.config.rag.embedding_model_path
         model_name = self.config.rag.embedding_model
-        
+
         if use_local and local_path:
-            logger.info(f"从本地加载嵌入模型: {local_path}")
             model_path = local_path
+            logger.info(f"从本地加载嵌入模型: {model_path}")
         else:
-            logger.info(f"从 Hugging Face 加载嵌入模型: {model_name}")
             model_path = model_name
-        
+            logger.info(f"从 Hugging Face 加载嵌入模型: {model_path}")
+
         try:
-            from transformers import AutoTokenizer, AutoModel
             from pathlib import Path
-            
+            from transformers import AutoTokenizer, AutoModel
+
             if use_local and local_path and not Path(local_path).exists():
-                logger.warning(f"本地模型路径不存在: {local_path}")
-                logger.info(f"回退到 Hugging Face: {model_name}")
                 model_path = model_name
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            self.model = AutoModel.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            
+                logger.warning(f"本地模型路径不存在，回退 Hugging Face: {model_name}")
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
             self.model.eval()
-            
+
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
                 logger.info("使用 GPU 加速嵌入计算")
-            
-            logger.info("BGE 嵌入模型加载成功")
-            
         except Exception as e:
-            logger.error(f"加载 BGE 模型失败: {e}")
+            logger.error(f"加载嵌入模型失败: {e}")
             self.model = None
             self.tokenizer = None
 
@@ -601,122 +429,95 @@ class EmbeddingModel(Embeddings):
             return self._encode_ollama(texts)
 
         if self.model is None or self.tokenizer is None:
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
-        
+            dim = int(self.config.rag.vector_db.dimension)
+            return [[0.0] * dim for _ in texts]
+
         try:
             encoded_input = self.tokenizer(
                 texts,
                 padding=True,
                 truncation=True,
                 max_length=512,
-                return_tensors='pt'
+                return_tensors="pt",
             )
-            
+
             if torch.cuda.is_available():
                 encoded_input = {k: v.cuda() for k, v in encoded_input.items()}
-            
+
             with torch.no_grad():
                 model_output = self.model(**encoded_input)
-                # BGE-M3 通常使用 [CLS] token 或 mean pooling
                 embeddings = model_output.last_hidden_state[:, 0]
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            
+
             return embeddings.cpu().numpy().tolist()
-            
         except Exception as e:
             logger.error(f"编码失败: {e}")
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
+            dim = int(self.config.rag.vector_db.dimension)
+            return [[0.0] * dim for _ in texts]
 
     def _encode_ollama(self, texts: List[str]) -> List[List[float]]:
-        import requests
-        import time
-        embeddings = []
-        
-        # 预处理：过滤出有效的文本，避免发向服务器导致崩溃
-        import re
-        valid_texts = []
-        for t in texts:
-            if t and t.strip():
-                # 过滤掉无法见字符、极度生僻的控制字符（这些可能导致 LLM 分词出 NaN）
-                cleaned_t = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', t)
-                valid_texts.append(cleaned_t)
-            else:
-                valid_texts.append("")
-                
-        # 提取真正需要发送的非空文本
-        texts_to_send = [t for t in valid_texts if t]
-        
-        if not texts_to_send:
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
-            
-        # 使用独立的 Session 并禁用 Keep-Alive，防止长连接引起的 Ollama HTTP 500
+        dim = int(self.config.rag.vector_db.dimension)
+        cleaned_texts = []
+        for text in texts:
+            if not text or not text.strip():
+                cleaned_texts.append("")
+                continue
+            sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+            cleaned_texts.append(sanitized)
+
+        non_empty = [t for t in cleaned_texts if t]
+        if not non_empty:
+            return [[0.0] * dim for _ in texts]
+
         headers = {"Connection": "close"}
-        
+
         try:
-            # 尝试使用最新的 /api/embed (支持批量编码)
-            # Ollama 对于非常大的批量可能会超时，甚至在后端崩溃并返回 500
-            # 减小发送批次大小，由上层的批处理保护
             with requests.Session() as session:
                 response = session.post(
                     f"{self.base_url}/api/embed",
-                    json={"model": self.model_name, "input": texts_to_send},
+                    json={"model": self.model_name, "input": non_empty},
                     headers=headers,
-                    timeout=60 # 重新增加一些超时时间
+                    timeout=60,
                 )
             if response.status_code == 200:
                 valid_embeddings = response.json().get("embeddings", [])
-                
-                # 重新映射回包含空字符串的原始列表顺序
-                return_embeddings = []
-                v_idx = 0
-                for t in valid_texts:
-                    if t and t.strip() and v_idx < len(valid_embeddings):
-                        return_embeddings.append(valid_embeddings[v_idx])
-                        v_idx += 1
+                mapped = []
+                valid_idx = 0
+                for text in cleaned_texts:
+                    if text and valid_idx < len(valid_embeddings):
+                        mapped.append(valid_embeddings[valid_idx])
+                        valid_idx += 1
                     else:
-                        return_embeddings.append([0.0] * self.config.rag.vector_db.dimension)
-                return return_embeddings
-            else:
-                logger.warning(f"Ollama /api/embed 发生异常: HTTP {response.status_code}，尝试降级为逐条请求")
+                        mapped.append([0.0] * dim)
+                return mapped
         except Exception as e:
-            logger.warning(f"Ollama /api/embed 发生异常: {e}，尝试降级为逐条请求")
-            
-        # 降级到逐条循环请求方案
-        for text in texts:
-            if not text or not text.strip():
-                # 处理空字符串，避免 Ollama 因为空 prompt 返回 500
-                embeddings.append([0.0] * self.config.rag.vector_db.dimension)
+            logger.warning(f"Ollama 批量编码失败，降级逐条编码: {e}")
+
+        embeddings = []
+        for text in cleaned_texts:
+            if not text:
+                embeddings.append([0.0] * dim)
                 continue
-                
-            retry_count = 0
-            while retry_count < 3:
+
+            emb = None
+            for _ in range(3):
                 try:
                     with requests.Session() as session:
                         response = session.post(
                             f"{self.base_url}/api/embeddings",
                             json={"model": self.model_name, "prompt": text},
                             headers=headers,
-                            timeout=15 # 设置超时，避免卡死死锁
+                            timeout=20,
                         )
-                    
                     if response.status_code == 200:
-                        embeddings.append(response.json()["embedding"])
+                        emb = response.json().get("embedding")
                         break
-                    else:
-                        # 如遇到500等错误，可能引擎过载，等待一下再重试
-                        logger.warning(f"Ollama 编码警告: HTTP {response.status_code}，将在 10 秒后重试...")
-                        time.sleep(5)
-                        retry_count += 1
-                        
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"Ollama 连接超时/失败，正在重试 ({retry_count}/3): {e}")
-                    time.sleep(5)
-                    
-            if retry_count == 3:
-                logger.error(f"Ollama 编码彻底失败 ({len(text)} 字符)")
-                embeddings.append([0.0] * self.config.rag.vector_db.dimension)
-                
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+            embeddings.append(emb if emb else [0.0] * dim)
+
         return embeddings
 
     def encode_single(self, text: str) -> List[float]:
@@ -724,524 +525,392 @@ class EmbeddingModel(Embeddings):
 
 
 class Reranker:
-    def __init__(self):
-        self.config = get_config()
-        self._ollama_rerank_supported: Optional[bool] = None
-        self._init_model()
+    """
+    关键词重排器。
 
-    def _init_model(self):
-        if self.config.rag.use_ollama:
-            self.base_url = self.config.rag.ollama.base_url
-            self.model_name = self.config.rag.ollama.reranker_model
-            logger.info(f"使用 Ollama 加载重排序模型: {self.model_name}")
-            return
+    核心规则：
+    1. 关键词权重采用候选集内的自适应区分度（类似 IDF），高频词自动降权。
+    2. 多关键词共同命中时给予阶梯奖励，增强“证据组合”信号。
+    3. 距离越小越相关，最终按距离升序排序。
+    """
 
-        use_local = self.config.rag.use_local_model
-        local_path = self.config.rag.reranker_model_path
-        model_name = self.config.rag.reranker_model
-        
-        if use_local and local_path:
-            logger.info(f"从本地加载重排序模型: {local_path}")
-            model_path = local_path
-        else:
-            logger.info(f"从 Hugging Face 加载重排序模型: {model_name}")
-            model_path = model_name
-
-    def rerank(self, query: str, chunks: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    def rerank(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        top_k: int,
+        keywords: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         if not chunks:
             return []
 
-        if self.config.rag.use_ollama:
-            return self._rerank_ollama(query, chunks)[:top_k]
+        ranked = []
+        normalized_keywords = self._normalize_keywords(keywords or [])
+        text_blobs = [self._build_text_blob(c) for c in chunks]
 
-        model = getattr(self, "model", None)
-        tokenizer = getattr(self, "tokenizer", None)
-        if model is None or tokenizer is None:
-            for chunk in chunks:
-                # 若无重排模型，回退到原始检索向量分（一般为 0.6~0.9 左右），避免暴露仅有 0.01 左右的 RRF 排序分
-                chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            sorted_chunks = sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
-            return sorted_chunks[:top_k]
+        keyword_df: Dict[str, int] = {}
+        keyword_idf: Dict[str, float] = {}
+        candidate_count = len(text_blobs)
+        for kw in normalized_keywords:
+            df = sum(1 for text in text_blobs if kw in text)
+            keyword_df[kw] = df
+            # 平滑 IDF：在当前候选集内出现越少，区分度越高。
+            keyword_idf[kw] = math.log((candidate_count + 1) / (df + 1)) + 1.0
 
-        try:
-            pairs = [[query, chunk["content"]] for chunk in chunks]
-            with torch.no_grad():
-                inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
-                if torch.cuda.is_available():
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
-                
-                scores = model(**inputs).logits.view(-1,).float()
-                scores = torch.sigmoid(scores).cpu().numpy().tolist()
+        # 高频词（在大多数候选中出现）自动降权，避免 Stop-word Trap。
+        effective_keywords = []
+        for kw in normalized_keywords:
+            ratio = keyword_df.get(kw, 0) / max(1, candidate_count)
+            if ratio >= 0.65:
+                continue
+            effective_keywords.append(kw)
 
-            for chunk, score in zip(chunks, scores):
-                chunk["rerank_score"] = score
+        # 若全部被判定为高频词，则保留区分度最高的少量词，避免完全失去重排信号。
+        if not effective_keywords and normalized_keywords:
+            effective_keywords = sorted(
+                normalized_keywords,
+                key=lambda x: keyword_idf.get(x, 0.0),
+                reverse=True,
+            )[:3]
 
-            sorted_chunks = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
-            return sorted_chunks[:top_k]
+        for idx, chunk in enumerate(chunks):
+            base_distance = float(chunk.get("score", 9999.0))
+            text_blob = text_blobs[idx]
 
-        except Exception as e:
-            logger.error(f"重排序失败: {e}")
-            for chunk in chunks:
-                chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            sorted_chunks = sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
-            return sorted_chunks[:top_k]
+            matched_keywords = [kw for kw in effective_keywords if kw in text_blob]
+            specificity_sum = sum(keyword_idf.get(kw, 0.0) for kw in matched_keywords)
+            coverage = len(matched_keywords) / max(1, len(effective_keywords))
 
-    def _rerank_ollama(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        import requests
+            # 自适应奖励：区分度越高、命中越多，奖励越大；上限防止过度改写排序。
+            keyword_boost = min(
+                0.35,
+                0.06 * specificity_sum + 0.04 * max(0, len(matched_keywords) - 1) + 0.02 * coverage,
+            )
 
-        # 标准 Ollama 默认不一定支持 /api/rerank。
-        # 这里优先尝试 rerank 端点；若返回 404，自动回退到 /api/generate 打分重排。
-        try:
-            if self._ollama_rerank_supported is not False:
-                response = requests.post(
-                    f"{self.base_url}/api/rerank",
-                    json={
-                        "model": self.model_name,
-                        "query": query,
-                        "documents": [c["content"] for c in chunks]
-                    },
-                    timeout=20
-                )
+            adjusted_distance = base_distance - keyword_boost
 
-                if response.status_code == 200:
-                    self._ollama_rerank_supported = True
-                    results = response.json().get("results", [])
-                    for res in results:
-                        idx = res.get("index")
-                        if isinstance(idx, int) and 0 <= idx < len(chunks):
-                            chunks[idx]["rerank_score"] = float(res.get("relevance_score", 0.0))
-                    for chunk in chunks:
-                        if "rerank_score" not in chunk:
-                            chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-                    return sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
+            item = dict(chunk)
+            item["raw_distance"] = base_distance
+            item["keyword_hits"] = matched_keywords
+            item["keyword_boost"] = keyword_boost
+            item["rerank_score"] = adjusted_distance
+            item["score"] = adjusted_distance
+            item["keyword_idf"] = {k: round(keyword_idf.get(k, 0.0), 3) for k in matched_keywords}
+            item["effective_keywords"] = effective_keywords
+            ranked.append(item)
 
-                if response.status_code == 404:
-                    self._ollama_rerank_supported = False
-                    logger.warning("Ollama 不支持 /api/rerank，已切换为 /api/generate 重排模式")
-                else:
-                    logger.warning(f"Ollama /api/rerank 异常: HTTP {response.status_code}，尝试 generate 重排")
+        ranked.sort(key=lambda x: float(x.get("score", 9999.0)))
+        return ranked[:top_k]
 
-            return self._rerank_with_ollama_generate(query, chunks)
-        except Exception as e:
-            logger.error(f"Ollama 重排序异常: {e}")
-            return self._rerank_with_ollama_generate(query, chunks)
-
-    def _rerank_with_ollama_generate(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        import requests
-
-        headers = {"Connection": "close"}
-        with requests.Session() as session:
-            for chunk in chunks:
-                prompt = self._build_rerank_prompt(query, str(chunk.get("content", "")))
-
-                score = None
-                for attempt in range(2):
-                    try:
-                        response = session.post(
-                            f"{self.base_url}/api/generate",
-                            json={
-                                "model": self.model_name,
-                                "prompt": prompt,
-                                "stream": False,
-                                "options": {
-                                    "temperature": 0,
-                                    "num_predict": 8,
-                                }
-                            },
-                            headers=headers,
-                            timeout=25,
-                        )
-                        if response.status_code == 200:
-                            text = str(response.json().get("response", ""))
-                            score = self._parse_score(text)
-                            break
-
-                        # 429/5xx 做一次轻量重试
-                        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                            time.sleep(0.2)
-                            continue
-                        break
-                    except Exception:
-                        if attempt == 0:
-                            time.sleep(0.2)
-                            continue
-                        break
-
-                base_score = float(chunk.get("original_score", chunk.get("score", 0.0)))
-                if score is None:
-                    chunk["rerank_score"] = base_score
-                else:
-                    # 仍保留向量分作为先验，避免生成式评分抖动。
-                    chunk["rerank_score"] = (0.8 * base_score) + (0.2 * score)
-
-                # 避免高并发短间隔请求打满 Ollama
-                time.sleep(0.05)
-
-        return sorted(chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-
-    def _build_rerank_prompt(self, query: str, document: str) -> str:
-        return (
-            "你是法律检索重排器。请评估 Document 对 Query 的相关性，"
-            "只输出 0 到 1 之间的小数，不要输出其它内容。\n"
-            f"Query: {query}\n"
-            f"Document: {document}\n"
-            "Score:"
-        )
-
-    def _parse_score(self, text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            score = float(match.group(0))
-            # 兼容输出 0-100 的情况
-            if score > 1.0:
-                score = score / 100.0
-            if score < 0.0:
-                score = 0.0
-            if score > 1.0:
-                score = 1.0
-            return score
-        except Exception:
-            return None
-
-    def _fallback_rerank(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """当外部 rerank 不可用时，使用词项覆盖率 + 初始分数进行稳健降级。"""
-        terms = self._extract_terms(query)
-        term_count = max(len(terms), 1)
-
-        for chunk in chunks:
-            base_score = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            doc = " ".join([
+    def _build_text_blob(self, chunk: Dict[str, Any]) -> str:
+        return " ".join(
+            [
                 str(chunk.get("law_name", "")),
                 str(chunk.get("article_num", "")),
                 str(chunk.get("content", "")),
-            ]).lower()
+            ]
+        ).lower()
 
-            hit = 0
-            for t in terms:
-                if t and t in doc:
-                    hit += 1
-            lexical_score = hit / term_count
+    def _normalize_keywords(self, keywords: List[str]) -> List[str]:
+        low_info = {
+            "法律", "法规", "条文", "规定", "相关", "问题", "情况", "处理", "如何", "怎么办",
+            "纠纷", "案件", "起诉", "诉讼", "请求", "支持", "认定", "成立", "是否",
+        }
+        low_info_lower = {x.lower() for x in low_info}
+        dedup = []
+        seen = set()
+        for item in keywords:
+            kw = re.sub(r"\s+", "", str(item or "")).strip().lower()
+            if len(kw) < 2 or kw in seen:
+                continue
+            if kw in low_info_lower:
+                continue
+            seen.add(kw)
+            dedup.append(kw)
+        return dedup
 
-            # 稳健融合：保留向量相似度主导，同时用词项命中修正排序。
-            chunk["rerank_score"] = (0.9 * base_score) + (0.1 * lexical_score)
-
-        return sorted(chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-
-    def _extract_terms(self, query: str) -> List[str]:
-        tokens = [t.strip().lower() for t in re.split(r"[\s,，。；;、:：()（）]+", query) if t.strip()]
-        if tokens:
-            return list(dict.fromkeys(tokens))[:16]
-
-        # 中文无空格时回退到双字词
-        chars = [query[i:i + 2].lower() for i in range(0, max(len(query) - 1, 1))]
-        return list(dict.fromkeys([c for c in chars if c.strip()]))[:16]
 
 class LegalRAG:
     def __init__(self):
         self.config = get_config()
-
         self.embedding_model = EmbeddingModel()
-        self.reranker = Reranker()
-        self.query_router = QueryRewriterRouter()
+        self.query_agent = QueryAgent()
         self.vector_db = VectorDBManager()
-
-        # BM25 稀疏检索器（支持 LangChain VectorStore 协议）
-        self.bm25_retriever = BM25SparseRetriever()
-        self._bm25_indexed = False
-
-        self._build_graph()
+        self.reranker = Reranker()
 
     def build_index(self, chunks: List[LawChunk], batch_size: int = 32):
         logger.info(f"开始构建索引，共 {len(chunks)} 个 chunks")
-
-        # 同时构建向量索引和 BM25 稀疏索引
-        bm25_docs = []
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [chunk.content for chunk in batch_chunks]
-
-            logger.info(f"正在处理批次: {i}/{len(chunks)}")
             embeddings = self.embedding_model.encode(texts)
             self.vector_db.insert_chunks(batch_chunks, embeddings)
-
-            # 同步收集 BM25 文档
-            for chunk in batch_chunks:
-                bm25_docs.append({
-                    "chunk_id": str(chunk.chunk_id),
-                    "content": chunk.content,
-                    "law_name": chunk.law_name,
-                    "article_num": chunk.article_num,
-                })
-
-        # 构建 BM25 索引
-        if bm25_docs:
-            self.bm25_retriever.index(bm25_docs)
-            self._bm25_indexed = True
-
+            logger.info(f"索引写入进度: {min(i + batch_size, len(chunks))}/{len(chunks)}")
         logger.info("索引构建完成")
 
-    # =============================================================================
-    # LangGraph 节点 — 替代 search() 中的各阶段线性处理
-    # =============================================================================
-    def _node_query_rewrite(self, state: RetrievalState) -> RetrievalState:
-        """Query 改写与路由决策。"""
-        plan = self.query_router.rewrite_and_route(state.original_query, state.filters)
-        route = plan.get("route", {})
-        state.need_retrieval = route.get("need_retrieval", True)
-        state.rewritten_queries = plan.get("rewrites", [])
-        state.primary_query = plan.get("rewrite_primary", state.original_query)
-        state.use_hybrid = bool(route.get("use_hybrid", True))
-        state.route_focus = route.get("focus", "law_article")
+    def search(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[RetrievalResult]:
+        result = self.search_with_trace(query, filters)
+        return result.get("results", [])
 
-        if not state.need_retrieval:
-            logger.info("路由判定无需检索，直接返回空结果")
+    def search_with_trace(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        original_query = (query or "").strip()
+        if not original_query:
+            return {"results": [], "trace": [], "query_used": "", "keywords": []}
 
-        query_tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", state.original_query) if t]
-        max_rewrites = 1 if not state.use_hybrid else (2 if (len(state.original_query) <= 8 and len(query_tokens) <= 2) else 4)
-        state.rewritten_queries = state.rewritten_queries[:max_rewrites]
+        merged_filters = filters or {}
+        retrieval_cfg = getattr(self.config.rag, "retrieval", None)
+        top_k_initial = max(1, int(getattr(retrieval_cfg, "top_k_initial", 10)))
+        top_k_final = max(1, int(getattr(retrieval_cfg, "top_k_final", 5)))
+        max_rounds = max(1, int(getattr(retrieval_cfg, "agentic_max_rounds", 3)))
+        min_rounds = max(1, int(getattr(retrieval_cfg, "agentic_min_rounds", 1)))
+        min_rounds = min(min_rounds, max_rounds)
+        min_results_to_stop = max(1, int(getattr(retrieval_cfg, "min_results_to_stop", top_k_final)))
 
-        logger.info(
-            f"改写查询数量: {len(state.rewritten_queries)}，路由焦点: {state.route_focus}，"
-            f"混合检索: {'开启' if state.use_hybrid else '关闭'}"
-        )
-        return state
+        trace: List[RetrievalTrace] = []
+        current_query = original_query
+        previous_query = None
+        final_keywords: List[str] = []
+        total_vector_hits = 0
+        final_reranked_results: List[Dict[str, Any]] = []
+        aggregated_candidates: Dict[str, Dict[str, Any]] = {}
 
-    def _node_dense_search(self, state: RetrievalState) -> RetrievalState:
-        """向量检索（Dense Search）。"""
-        if not state.need_retrieval:
-            return state
+        rewrite_decision = self.query_agent.should_rewrite(original_query)
+        if rewrite_decision.get("should_rewrite", False):
+            rewritten = self.query_agent.rewrite_query(original_query, force=True)
+            if rewritten and rewritten != original_query:
+                previous_query = original_query
+                current_query = rewritten
 
-        merged = self._merge_filters(state.filters, {})
-        top_k = self.config.rag.retrieval.top_k_initial
-        results = []
-
-        for q in state.rewritten_queries:
-            embedding = self.embedding_model.encode_single(q)
-            dense = self.vector_db.search(embedding, top_k, merged)
-            for item in dense:
-                item["retrieval_channel"] = "dense"
-            results.extend(dense)
-
-        state.dense_results = results
-        return state
-
-    def _node_sparse_search(self, state: RetrievalState) -> RetrievalState:
-        """稀疏检索（BM25）。优先使用独立 BM25 索引，降级到 Milvus keyword_search。"""
-        if not state.need_retrieval or not state.use_hybrid:
-            state.sparse_results = []
-            return state
-
-        top_k = self.config.rag.retrieval.top_k_initial
-        results = []
-
-        for q in state.rewritten_queries:
-            if self._bm25_indexed:
-                # 优先使用独立 BM25 检索器
-                sparse = self.bm25_retriever.search(q, top_k)
-                for item in sparse:
-                    item["retrieval_channel"] = "sparse"
-                results.extend(sparse)
-            else:
-                # 降级到 Milvus keyword_search
-                merged = self._merge_filters(state.filters, {})
-                sparse = self.vector_db.keyword_search(q, top_k, merged)
-                for item in sparse:
-                    item["retrieval_channel"] = "sparse"
-                results.extend(sparse)
-
-        state.sparse_results = results
-        return state
-
-    def _node_fusion(self, state: RetrievalState) -> RetrievalState:
-        """RRF 融合。"""
-        if not state.dense_results and not state.sparse_results:
-            state.fused_results = []
-            return state
-
-        rrf_k = 60
-        fused = {}
-
-        def _ranked(items):
-            return sorted(items, key=lambda x: x.get("score", 0.0), reverse=True)
-
-        for rank_idx, item in enumerate(_ranked(state.dense_results), 1):
-            key = str(item.get("chunk_id", rank_idx))
-            if key not in fused:
-                fused[key] = dict(item)
-                fused[key]["original_score"] = float(item.get("score", 0.0))
-            fused[key]["score"] += 1.0 / (rrf_k + rank_idx)
-            fused[key]["dense_rank"] = rank_idx
-
-        for rank_idx, item in enumerate(_ranked(state.sparse_results), 1):
-            key = str(item.get("chunk_id", rank_idx))
-            if key not in fused:
-                fused[key] = dict(item)
-                fused[key]["original_score"] = float(item.get("score", 0.0))
-            fused[key]["score"] += 0.2 / (rrf_k + rank_idx)
-            fused[key]["sparse_rank"] = rank_idx
-
-        fused_list = sorted(fused.values(), key=lambda x: x.get("score", 0.0), reverse=True)
-        top_k_initial = self.config.rag.retrieval.top_k_initial
-        state.fused_results = fused_list[:top_k_initial * 3]
-        state.fused_results = self._apply_temporal_filter(state.fused_results, {})
-
-        logger.info(
-            f"初步检索到 {len(state.fused_results)} 个结果 "
-            f"(dense={len(state.dense_results)}, sparse={len(state.sparse_results)})"
-        )
-        return state
-
-    def _node_rerank(self, state: RetrievalState) -> RetrievalState:
-        """重排。"""
-        top_k_final = self.config.rag.retrieval.top_k_final
-        reranked = self.reranker.rerank(state.primary_query, state.fused_results, top_k_final)
-
-        retrieval_results = []
-        for idx, result in enumerate(reranked):
-            metadata = dict(result.get("metadata") or {})
-            metadata["route_focus"] = state.route_focus
-            metadata["context_tier"] = self._context_tier_by_rank(idx)
-            metadata["query_rewrite"] = state.primary_query
-
-            chunk = LawChunk(
-                chunk_id=result["chunk_id"],
-                law_name=result["law_name"],
-                article_num=result["article_num"],
-                content=result["content"],
-                level=result["level"],
-                metadata=metadata,
+        for round_idx in range(1, max_rounds + 1):
+            thought = (
+                f"第{round_idx}轮：先向量召回 {top_k_initial} 条，再做关键词命中重排，"
+                "若命中不足则继续改写 query。"
             )
-            retrieval_results.append(
-                RetrievalResult(
-                    chunk=chunk,
-                    score=result.get("rerank_score", result.get("score", 0.0)),
-                    rank=idx + 1,
+            keywords = self.query_agent.extract_keywords(current_query, max_keywords=8)
+            final_keywords = keywords
+
+            dense = self._dense_search(current_query, merged_filters, top_k_initial)
+            # 每轮先保留更大的候选池，跨轮聚合后再截断为 top_k_final，
+            # 避免“局部前十”过早截断造成有效条文丢失。
+            reranked = self.reranker.rerank(current_query, dense, top_k_initial, keywords=keywords)
+            total_vector_hits += len(dense)
+
+            trace.append(
+                RetrievalTrace(
+                    round_index=round_idx,
+                    thought=thought,
+                    query_used=current_query,
+                    rewritten_from=previous_query,
+                    keywords=keywords,
+                    vector_hits=len(dense),
+                    kept_hits=len(reranked),
                 )
             )
 
-        state.final_results = retrieval_results
-        logger.info(f"最终返回 {len(retrieval_results)} 个结果")
-        return state
+            for item in reranked:
+                key = self._dedup_candidate_key(item)
+                old = aggregated_candidates.get(key)
+                if old is None or float(item.get("score", 9999.0)) < float(old.get("score", 9999.0)):
+                    aggregated_candidates[key] = item
 
-    # =============================================================================
-    # 条件边路由 — 替代 search() 中的 if-else 判断
-    # =============================================================================
-    def _route_after_rewrite(self, state: RetrievalState) -> Literal["dense_search", "rerank"]:
-        if not state.need_retrieval:
-            return "rerank"
-        return "dense_search"
+            final_reranked_results = sorted(
+                aggregated_candidates.values(),
+                key=lambda x: float(x.get("score", 9999.0)),
+            )[:top_k_final]
 
-    def _route_after_dense(self, state: RetrievalState) -> Literal["sparse_search", "fusion"]:
-        if state.use_hybrid and state.need_retrieval:
-            return "sparse_search"
-        return "fusion"
+            has_enough_results = len(aggregated_candidates) >= min_results_to_stop
+            has_completed_min_rounds = round_idx >= min_rounds
+            if has_completed_min_rounds and has_enough_results:
+                break
 
-    def _route_after_sparse(self, state: RetrievalState) -> Literal["fusion"]:
-        return "fusion"
+            if round_idx >= max_rounds:
+                break
 
-    # =============================================================================
-    # 构建 StateGraph
-    # =============================================================================
-    def _build_graph(self):
-        workflow = StateGraph(RetrievalState)
+            next_query = self.query_agent.rewrite_query(current_query, force=True)
+            if not next_query:
+                next_query = current_query
+            if next_query == current_query:
+                diversified = f"{current_query} 相关法律依据 司法解释".strip()
+                if diversified != current_query:
+                    next_query = diversified
 
-        workflow.add_node("query_rewrite", self._node_query_rewrite)
-        workflow.add_node("dense_search", self._node_dense_search)
-        workflow.add_node("sparse_search", self._node_sparse_search)
-        workflow.add_node("fusion", self._node_fusion)
-        workflow.add_node("rerank", self._node_rerank)
+            if next_query == current_query and has_completed_min_rounds:
+                break
 
-        workflow.add_conditional_edges(
-            "query_rewrite",
-            self._route_after_rewrite,
-            {
-                "dense_search": "dense_search",
-                "rerank": "rerank",
-            },
-        )
+            previous_query = current_query
+            current_query = next_query
 
-        workflow.add_conditional_edges(
-            "dense_search",
-            self._route_after_dense,
-            {
-                "sparse_search": "sparse_search",
-                "fusion": "fusion",
-            },
-        )
-
-        workflow.add_edge("sparse_search", "fusion")
-        workflow.add_edge("fusion", "rerank")
-        workflow.add_edge("rerank", END)
-
-        workflow.set_entry_point("query_rewrite")
-        self._graph = workflow.compile()
-
-    # =============================================================================
-    # 对外接口 — 保持原有签名，内部委托给 Graph
-    # =============================================================================
-    def search(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[RetrievalResult]:
-        logger.info(f"执行检索寻找前50条查询: {query[:50]}...")
-
-        state = RetrievalState(
-            original_query=query,
-            filters=filters or {},
-            need_retrieval=True,
-            rewritten_queries=[],
-            primary_query=query,
-            use_hybrid=True,
+        retrieval_results = self._to_retrieval_results(
+            final_reranked_results,
+            query_used=current_query,
+            keywords=final_keywords,
             route_focus="law_article",
-            dense_results=[],
-            sparse_results=[],
-            fused_results=[],
-            final_results=[],
         )
 
-        result = self._graph.invoke(state)
-        return result["final_results"]
+        logger.info(
+            f"Agentic-RAG 完成，轮次: {len(trace)}，召回: {total_vector_hits}，"
+            f"返回: {len(retrieval_results)}"
+        )
 
-    # =============================================================================
-    # 保留的辅助方法 — 供节点调用
-    # =============================================================================
-    def _merge_filters(self, user_filters: Optional[Dict[str, Any]], hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        merged = {}
-        if user_filters:
-            merged.update(user_filters)
-        if hints:
-            merged.update(hints)
-        return merged
+        return {
+            "results": retrieval_results,
+            "trace": [t.__dict__ for t in trace],
+            "query_used": current_query,
+            "keywords": final_keywords,
+        }
 
-    def _apply_temporal_filter(self, results: List[Dict[str, Any]], hints: Dict[str, Any]) -> List[Dict[str, Any]]:
-        event_date = hints.get("event_date") if hints else None
-        if not event_date:
-            return results
+    def answer_with_citations(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        search_result = self.search_with_trace(query, filters)
+        results = search_result.get("results", [])
 
-        event_dt = self._parse_date(event_date)
-        if not event_dt:
-            return results
+        if not results:
+            return {
+                "answer": "未检索到相关法条，建议补充案件主体、行为、时间等关键信息后重试。",
+                "citations": [],
+                "trace": search_result.get("trace", []),
+                "query_used": search_result.get("query_used", query),
+                "keywords": search_result.get("keywords", []),
+            }
 
-        filtered = []
-        for item in results:
-            eff = self._parse_date(str(item.get("effective_date", "")))
-            rep = self._parse_date(str(item.get("repeal_date", "")))
-            if eff and event_dt < eff:
-                continue
-            if rep and event_dt > rep:
-                continue
-            filtered.append(item)
-        return filtered
+        citations = []
+        evidence_blocks = []
+        for idx, item in enumerate(results, 1):
+            chunk = item.chunk
+            citations.append(
+                {
+                    "id": idx,
+                    "law_name": chunk.law_name,
+                    "article_num": chunk.article_num,
+                    "distance": item.score,
+                    "snippet": chunk.content[:220],
+                }
+            )
+            evidence_blocks.append(
+                f"[{idx}] {chunk.law_name} {chunk.article_num}\n{chunk.content[:1200]}"
+            )
 
-    def _parse_date(self, text: str) -> Optional[datetime]:
-        if not text:
-            return None
-        candidates = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y"]
-        for fmt in candidates:
-            try:
-                return datetime.strptime(text, fmt)
-            except Exception:
-                continue
-        return None
+        answer = self._synthesize_answer(query, evidence_blocks)
+        return {
+            "answer": answer,
+            "citations": citations,
+            "trace": search_result.get("trace", []),
+            "query_used": search_result.get("query_used", query),
+            "keywords": search_result.get("keywords", []),
+        }
+
+    def _dense_search(self, query: str, filters: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
+        embedding = self.embedding_model.encode_single(query)
+        return self.vector_db.search(embedding, top_k, filters)
+
+    def _dedup_candidate_key(self, item: Dict[str, Any]) -> str:
+        chunk_id = str(item.get("chunk_id", "")).strip()
+        if chunk_id:
+            return f"id::{chunk_id}"
+
+        law_name = str(item.get("law_name", "")).strip()
+        article_num = str(item.get("article_num", "")).strip()
+        if law_name or article_num:
+            return f"law::{law_name}::{article_num}"
+
+        content = str(item.get("content", "")).strip()
+        return f"content::{content[:120]}"
+
+    def _to_retrieval_results(
+        self,
+        reranked: List[Dict[str, Any]],
+        query_used: str,
+        keywords: List[str],
+        route_focus: str,
+    ) -> List[RetrievalResult]:
+        results: List[RetrievalResult] = []
+        for idx, item in enumerate(reranked, 1):
+            metadata = dict(item.get("metadata") or {})
+            metadata.update(
+                {
+                    "route_focus": route_focus,
+                    "query_rewrite": query_used,
+                    "context_tier": self._context_tier_by_rank(idx - 1),
+                    "keywords": keywords,
+                    "keyword_hits": item.get("keyword_hits", []),
+                    "raw_distance": item.get("raw_distance", item.get("score", 0.0)),
+                    "keyword_boost": item.get("keyword_boost", 0.0),
+                }
+            )
+
+            chunk = LawChunk(
+                chunk_id=str(item.get("chunk_id", "")),
+                law_name=str(item.get("law_name", "")),
+                article_num=str(item.get("article_num", "")),
+                content=str(item.get("content", "")),
+                level=str(item.get("level", "")),
+                metadata=metadata,
+            )
+            results.append(
+                RetrievalResult(
+                    chunk=chunk,
+                    score=float(item.get("score", 0.0)),
+                    rank=idx,
+                )
+            )
+        return results
+
+    def _synthesize_answer(self, query: str, evidence_blocks: List[str]) -> str:
+        llm_cfg = self.config.llm
+        base_url = str(llm_cfg.base_url).rstrip("/")
+        model = llm_cfg.primary_model
+        api_key = llm_cfg.api_key
+
+        if not base_url or not model or not api_key or str(api_key).startswith("${"):
+            return self._fallback_answer(query, evidence_blocks)
+
+        prompt = (
+            "你是法律分析助手。请严格基于给定证据回答用户问题，并在句末使用 [编号] 引用。\n"
+            "不要编造未提供的法律依据。\n\n"
+            f"用户问题：{query}\n\n"
+            "证据：\n"
+            + "\n\n".join(evidence_blocks)
+        )
+
+        payload = {
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": min(int(llm_cfg.max_tokens), 1200),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是专业法律助手，回答必须引用证据编号。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=getattr(self.config.performance, "request_timeout", 120),
+            )
+            response.raise_for_status()
+            content = (
+                response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            )
+            return content or self._fallback_answer(query, evidence_blocks)
+        except Exception as e:
+            logger.error(f"基于证据生成回答失败: {e}")
+            return self._fallback_answer(query, evidence_blocks)
+
+    def _fallback_answer(self, query: str, evidence_blocks: List[str]) -> str:
+        lines = [f"问题：{query}", "", "可参考法条："]
+        for block in evidence_blocks[:5]:
+            first_line = block.splitlines()[0] if block else ""
+            lines.append(first_line)
+        lines.append("")
+        lines.append("说明：当前为降级回答，请结合上述法条原文进行人工研判。")
+        return "\n".join(lines)
 
     def _context_tier_by_rank(self, rank_index: int) -> int:
         if rank_index == 0:
@@ -1268,14 +937,16 @@ class LegalRAG:
 
         relevant_laws = []
         for law_name, law_results in law_groups.items():
-            relevant_laws.append({
-                "law_name": law_name,
-                "articles": [r.chunk.article_num for r in law_results],
-                "contents": [r.chunk.content for r in law_results],
-                "max_score": max(r.score for r in law_results)
-            })
+            relevant_laws.append(
+                {
+                    "law_name": law_name,
+                    "articles": [r.chunk.article_num for r in law_results],
+                    "contents": [r.chunk.content for r in law_results],
+                    "min_distance": min(r.score for r in law_results),
+                }
+            )
 
-        relevant_laws.sort(key=lambda x: x["max_score"], reverse=True)
+        relevant_laws.sort(key=lambda x: x["min_distance"])
         return relevant_laws[:top_k]
 
     def get_collection_stats(self) -> Dict[str, Any]:
@@ -1285,40 +956,17 @@ class LegalRAG:
         logger.warning("重置向量数据库索引")
         self.vector_db.delete_collection()
         self.vector_db = VectorDBManager()
-        self.bm25_retriever = BM25SparseRetriever()
-        self._bm25_indexed = False
-        self._build_graph()
 
-    # =============================================================================
-    # LangChain Retriever 兼容接口 — 将完整检索流程暴露为标准 Retriever
-    # =============================================================================
     def as_retriever(self, top_k: int = 5) -> "HybridLegalRetriever":
-        """
-        将 LegalRAG 的混合检索流程封装为 LangChain 兼容 Retriever。
-
-        Usage:
-            from langchain_core.retrievers import RetrieverLike
-            retriever: RetrieverLike = legal_rag.as_retriever(top_k=5)
-            docs = retriever.invoke("民间借贷 利息计算")
-        """
         return HybridLegalRetriever(self, top_k)
 
 
 class HybridLegalRetriever:
-    """
-    LangChain 兼容的混合检索 Retriever。
-
-    封装 LegalRAG.search()，对外暴露 LangChain RetrieverLike 接口：
-      - invoke(query)           → 同步检索
-      - get_relevant_documents(query) → 别名方法（兼容旧代码）
-    """
-
     def __init__(self, legal_rag: LegalRAG, top_k: int = 5):
         self._rag = legal_rag
         self._top_k = top_k
 
     def invoke(self, query: str) -> List["RetrievedDoc"]:
-        """LangChain Retriever 协议：同步检索。"""
         results = self._rag.search(query)
         return [
             RetrievedDoc(
@@ -1327,7 +975,7 @@ class HybridLegalRetriever:
                     "law_name": r.chunk.law_name,
                     "article_num": r.chunk.article_num,
                     "level": r.chunk.level,
-                    "score": r.score,
+                    "distance": r.score,
                     "rank": r.rank,
                     **r.chunk.metadata,
                 },
@@ -1336,7 +984,6 @@ class HybridLegalRetriever:
         ]
 
     def get_relevant_documents(self, query: str) -> List["RetrievedDoc"]:
-        """LangChain 旧版 Retriever 接口（别名）。"""
         return self.invoke(query)
 
     def __call__(self, query: str) -> List["RetrievedDoc"]:
@@ -1344,13 +991,6 @@ class HybridLegalRetriever:
 
 
 class RetrievedDoc:
-    """
-    轻量级文档对象，替代 langchain_core.documents.Document。
-
-    避免引入 langchain_core 导致的 pydantic 版本冲突，
-    同时保持与 LangChain Document 完全兼容的字段结构。
-    """
-
     def __init__(self, page_content: str, metadata: Optional[dict] = None):
         self.page_content = page_content
         self.metadata = metadata or {}
@@ -1362,5 +1002,4 @@ class RetrievedDoc:
         return self.page_content
 
     def to_langchain_doc(self) -> Dict[str, Any]:
-        """转换为 LangChain Document 格式（lazy import，避免顶层依赖）。"""
         return {"page_content": self.page_content, "metadata": self.metadata}

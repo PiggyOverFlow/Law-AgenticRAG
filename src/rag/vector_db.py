@@ -40,6 +40,7 @@ class VectorDBManager:
             raise
 
         collection_name = self.config.rag.vector_db.collection_name
+        self.metric_type = str(getattr(self.config.rag.vector_db, "metric_type", "COSINE")).upper()
 
         if utility.has_collection(collection_name):
             self.collection = Collection(collection_name)
@@ -49,7 +50,7 @@ class VectorDBManager:
                 logger.warning(f"集合 {collection_name} 缺少索引，正在补充创建...")
                 index_params = {
                     "index_type": "AUTOINDEX",
-                    "metric_type": "COSINE",
+                    "metric_type": self.metric_type,
                     "params": {}
                 }
                 self.collection.create_index(field_name="embedding", index_params=index_params)
@@ -76,12 +77,15 @@ class VectorDBManager:
             # 创建索引 (Milvus-lite 本地模式不支持 HNSW，改用 AUTOINDEX)
             index_params = {
                 "index_type": "AUTOINDEX",
-                "metric_type": "COSINE",  # 推荐使用余弦相似度
+                "metric_type": self.metric_type,
                 "params": {}
             }
             self.collection.create_index(field_name="embedding", index_params=index_params)
             self.collection.load()
-            logger.info(f"创建并加载新 Milvus 集合: {collection_name}，维度: {self.config.rag.vector_db.dimension}")
+            logger.info(
+                f"创建并加载新 Milvus 集合: {collection_name}，维度: {self.config.rag.vector_db.dimension}，"
+                f"metric={self.metric_type}"
+            )
 
     def insert_chunks(self, chunks: List[LawChunk], embeddings: List[List[float]]):
         """插入法律片段到 Milvus"""
@@ -105,7 +109,7 @@ class VectorDBManager:
 
     def search(self, query_embedding: List[float], top_k: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """在 Milvus 中进行向量搜索"""
-        search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+        search_params = {"metric_type": self.metric_type, "params": {}}
         expr = self._build_expr(filters)
 
         results = self.collection.search(
@@ -119,9 +123,12 @@ class VectorDBManager:
 
         formatted_results = []
         for result in results[0]:
+            raw_score = float(result.score)
+            distance = self._to_distance(raw_score)
             formatted_results.append({
                 "chunk_id": result.id,
-                "score": result.score,
+                "score": distance,
+                "raw_score": raw_score,
                 "law_name": result.entity.get("law_name"),
                 "article_num": result.entity.get("article_num"),
                 "content": result.entity.get("content"),
@@ -131,7 +138,20 @@ class VectorDBManager:
                 "repeal_date": result.entity.get("repeal_date"),
             })
 
+        # 统一语义：score 为距离，越小越相关。
+        formatted_results.sort(key=lambda x: float(x.get("score", 9999.0)))
         return formatted_results
+
+    def _to_distance(self, score: float) -> float:
+        """
+        统一把底层分值转换为“距离”，确保上层逻辑稳定：距离越小越相关。
+
+        - L2/IP 等距离型指标：直接使用 score
+        - COSINE 相似度：转为 1 - sim
+        """
+        if self.metric_type == "COSINE":
+            return 1.0 - score
+        return score
 
     def keyword_search(self, query: str, top_k: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """基于关键词的稀疏检索（Milvus 标量过滤 + 词项重叠打分）。"""
@@ -225,6 +245,7 @@ class VectorDBManager:
         return {
             "type": "milvus",
             "collection": self.collection.name,
+            "metric_type": self.metric_type,
             "num_entities": stats,
             "description": self.collection.description,
             "vectors_count": stats

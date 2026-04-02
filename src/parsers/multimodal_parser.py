@@ -133,7 +133,28 @@ class MultimodalParser:
         return events
 
     def _extract_events_from_text(self, evidence: TextEvidence) -> List[LegalEvent]:
-        return []
+        content = (evidence.content or "").strip()
+        if not content:
+            return []
+
+        normalized = re.sub(r"\s+", " ", content)
+        sentences = [s.strip() for s in re.split(r"[。！？!?\n]+", normalized) if s.strip()]
+
+        main_time = self._extract_datetime(normalized)
+        cause = self._infer_cause(normalized)
+
+        # 文本证据先聚合为一个主事件，避免将同一段事实过度切碎。
+        event = LegalEvent(
+            evident_type="文本",
+            time=main_time,
+            place=None,
+            cause=cause,
+            process="；".join(sentences[:20]),
+            result=self._infer_result(normalized),
+            source_file=evidence.file_path,
+            timestamp=None,
+        )
+        return [event]
 
     def _extract_events_from_image(self, evidence: ImageEvidence) -> List[LegalEvent]:
         return []
@@ -196,6 +217,26 @@ class MultimodalParser:
                 all_events.extend(events)
                 evidence_summary_parts.append(f"文件: {file_path}")
                 evidence_summary_parts.append(f"类型: {evidence.__class__.__name__}")
+                if isinstance(evidence, TextEvidence):
+                    snippet = re.sub(r"\s+", " ", evidence.content).strip()[:800]
+                    evidence_summary_parts.append(f"内容摘要: {snippet}")
+                elif isinstance(evidence, ImageEvidence):
+                    image_summary = " ".join([
+                        (evidence.ocr_text or "").strip()[:300],
+                        (evidence.scene_description or "").strip()[:200],
+                    ]).strip()
+                    if image_summary:
+                        evidence_summary_parts.append(f"内容摘要: {image_summary}")
+                elif isinstance(evidence, AudioEvidence):
+                    transcript = " ".join([seg.text for seg in evidence.segments[:20] if seg.text])
+                    if transcript:
+                        evidence_summary_parts.append(f"内容摘要: {transcript[:800]}")
+                elif isinstance(evidence, VideoEvidence):
+                    frame_text = " ".join([f.description for f in evidence.frames[:20] if f.description])
+                    audio_text = " ".join([seg.text for seg in evidence.audio_evidence.segments[:20] if seg.text])
+                    merged = f"{frame_text} {audio_text}".strip()
+                    if merged:
+                        evidence_summary_parts.append(f"内容摘要: {merged[:800]}")
             except Exception as e:
                 logger.error(f"解析文件失败 {file_path}: {e}")
         
@@ -208,4 +249,63 @@ class MultimodalParser:
         )
 
     def _extract_key_disputes(self, events: List[LegalEvent]) -> List[str]:
-        return []
+        if not events:
+            return []
+
+        merged_text = "\n".join([
+            " ".join([
+                (event.cause or ""),
+                (event.process or ""),
+                (event.result or ""),
+            ])
+            for event in events
+        ])
+
+        disputes: List[str] = []
+        if any(k in merged_text for k in ["借款", "民间借贷", "出借"]):
+            disputes.append("借贷法律关系是否成立")
+
+        principal_match = re.search(r"(\d+(?:\.\d+)?)\s*(万)?\s*元", merged_text)
+        if principal_match:
+            amount = principal_match.group(1)
+            unit = principal_match.group(2) or ""
+            disputes.append(f"借款本金金额为{amount}{unit}元")
+
+        monthly_rate = re.search(r"月利率\s*([0-9]+(?:\.[0-9]+)?%)", merged_text)
+        annual_rate = re.search(r"年利率\s*([0-9]+(?:\.[0-9]+)?%)", merged_text)
+        if monthly_rate:
+            disputes.append(f"约定利率为月利率{monthly_rate.group(1)}")
+        elif annual_rate:
+            disputes.append(f"约定利率为年利率{annual_rate.group(1)}")
+
+        term_match = re.search(r"借款期限\s*为\s*([0-9一二三四五六七八九十两]+个?月)", merged_text)
+        if term_match:
+            disputes.append(f"借款期限为{term_match.group(1)}")
+
+        if any(k in merged_text for k in ["未按约定归还", "未偿还", "拒不归还", "逾期"]):
+            disputes.append("被告是否应承担逾期还款责任")
+
+        return list(dict.fromkeys(disputes))[:8]
+
+    def _extract_datetime(self, text: str) -> Optional[datetime]:
+        match = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text)
+        if not match:
+            return None
+        try:
+            return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except Exception:
+            return None
+
+    def _infer_cause(self, text: str) -> str:
+        if any(k in text for k in ["借款", "出借", "民间借贷"]):
+            return "民间借贷"
+        if any(k in text for k in ["劳动", "工资", "辞退"]):
+            return "劳动争议"
+        if any(k in text for k in ["交通事故", "碰撞", "交警"]):
+            return "交通事故"
+        return "待识别"
+
+    def _infer_result(self, text: str) -> str:
+        if any(k in text for k in ["未按约定归还", "未偿还", "逾期"]):
+            return "借款到期未清偿"
+        return "待补充"
