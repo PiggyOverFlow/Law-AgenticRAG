@@ -85,3 +85,5 @@ htmlcov/
 # Documentation
 docs/
 dataset/
+
+output/
