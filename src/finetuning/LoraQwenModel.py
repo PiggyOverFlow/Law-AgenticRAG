@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import re
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -29,14 +30,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QLoraTrainingConfig:
-    model_name_or_path: str = "Qwen/Qwen3-8B-Instruct"
-    output_dir: str = "./output/qlora_finetuned"
-    data_path: str = "./dataset/finetuning_data.json"
+    model_name_or_path: str = "/app/model/models/Qwen/Qwen3-8B"
+    output_dir: str = "./output/qwen3_8b_lora"
+    data_path: str = "./dataset/lora_data/最核心9k测试题_5k.json"
     
     lora_r: int = 64
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    lora_scope: str = "qv"
+    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 2
@@ -55,6 +57,10 @@ class QLoraTrainingConfig:
     
     resume_from_checkpoint: Optional[str] = None
     deepspeed: Optional[str] = None
+    train_on_dialogue_only: bool = False
+    report_to: List[str] = field(default_factory=lambda: ["wandb"])
+    wandb_project: str = "lawrag-qwen3-8b-lora"
+    wandb_run_name: str = ""
 
 
 class QLoraQwenTrainer:
@@ -80,6 +86,7 @@ class QLoraQwenTrainer:
 
     def load_model_and_tokenizer(self):
         logger.info(f"加载模型: {self.config.model_name_or_path}")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name_or_path,
@@ -102,22 +109,24 @@ class QLoraQwenTrainer:
             self.config.model_name_or_path,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2"
+            trust_remote_code=True
         )
         
         self.model = prepare_model_for_kbit_training(self.model)
+        if hasattr(self.model, "config"):
+            self.model.config.use_cache = False
         
         logger.info("模型和分词器加载完成")
 
     def setup_lora(self):
         logger.info("配置QLoRA参数")
+        target_modules = self._resolve_lora_target_modules()
         
         lora_config = LoraConfig(
             r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout,
-            target_modules=self.config.lora_target_modules,
+            target_modules=target_modules,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False
@@ -129,6 +138,26 @@ class QLoraQwenTrainer:
         
         logger.info("QLoRA配置完成")
 
+    def _resolve_lora_target_modules(self) -> List[str]:
+        """按范围选择更稳妥的 LoRA 注入层，默认只调 Q/V。"""
+        scope = str(getattr(self.config, "lora_scope", "qv") or "qv").strip().lower()
+        scope_map = {
+            "q": ["q_proj"],
+            "qv": ["q_proj", "v_proj"],
+            "qkv": ["q_proj", "k_proj", "v_proj"],
+            "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "full": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        }
+
+        configured = [module for module in self.config.lora_target_modules if module]
+        if configured and scope == "custom":
+            target_modules = configured
+        else:
+            target_modules = scope_map.get(scope, configured or scope_map["qv"])
+
+        logger.info("LoRA 目标层(scope=%s): %s", scope, ", ".join(target_modules))
+        return target_modules
+
     def load_training_data(self, data_path: Optional[str] = None) -> Dataset:
         data_path = data_path or self.config.data_path
         
@@ -139,6 +168,8 @@ class QLoraQwenTrainer:
         
         with open(data_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
+        data = self._normalize_training_examples(data)
         
         logger.info(f"加载了 {len(data)} 条训练数据")
         
@@ -152,6 +183,56 @@ class QLoraQwenTrainer:
         )
         
         return processed_dataset
+
+    def _normalize_training_examples(self, data: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """兼容多种本地数据集格式，统一转换为 instruction/input/output。"""
+        normalized: List[Dict[str, str]] = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            if {"instruction", "output"}.issubset(item.keys()):
+                normalized.append(
+                    {
+                        "instruction": str(item.get("instruction", "")).strip(),
+                        "input": str(item.get("input", "")).strip(),
+                        "output": str(item.get("output", "")).strip(),
+                    }
+                )
+                continue
+
+            question = str(item.get("question", "")).strip()
+            answer = str(item.get("answer", "")).strip()
+            reference = str(item.get("reference", "")).strip()
+            dialogue = str(item.get("dialogue", "")).strip()
+
+            if not answer:
+                continue
+
+            if self.config.train_on_dialogue_only and dialogue:
+                instruction = "请根据法律问答示例学习作答风格。"
+                input_text = dialogue
+            else:
+                instruction = "请根据法律规定准确回答问题，并在必要时点明对应法律依据。"
+                input_parts = []
+                if question:
+                    input_parts.append(f"问题：{question}")
+                if reference:
+                    input_parts.append(f"参考依据：{reference}")
+                if dialogue:
+                    input_parts.append(f"示例对话：{dialogue}")
+                input_text = "\n".join(input_parts).strip()
+
+            normalized.append(
+                {
+                    "instruction": instruction,
+                    "input": input_text,
+                    "output": answer,
+                }
+            )
+
+        return normalized
 
     def _create_sample_data(self, data_path: str):
         sample_data = [
@@ -191,71 +272,90 @@ class QLoraQwenTrainer:
         instructions = examples["instruction"]
         inputs = examples.get("input", [""] * len(instructions))
         outputs = examples["output"]
-        
-        prompts = []
-        for instruction, input_text in zip(instructions, inputs):
+
+        input_ids_batch: List[List[int]] = []
+        attention_masks_batch: List[List[int]] = []
+        labels_batch: List[List[int]] = []
+
+        for instruction, input_text, output_text in zip(instructions, inputs, outputs):
             if input_text:
                 prompt = f"<|im_start|>system\n你是一个专业的法律助手，请根据法律条文和案例提供准确的法律建议。<|im_end|>\n<|im_start|>user\n{instruction}\n{input_text}<|im_end|>\n<|im_start|>assistant\n"
             else:
                 prompt = f"<|im_start|>system\n你是一个专业的法律助手，请根据法律条文和案例提供准确的法律建议。<|im_end|>\n<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
-            prompts.append(prompt)
-        
-        model_inputs = self.tokenizer(
-            prompts,
-            max_length=self.config.max_seq_length,
-            padding=True,
-            truncation=True,
-            return_tensors=None
-        )
-        
-        labels = self.tokenizer(
-            outputs,
-            max_length=self.config.max_seq_length,
-            padding=True,
-            truncation=True,
-            return_tensors=None
-        )
-        
-        model_inputs["labels"] = labels["input_ids"]
-        
-        return model_inputs
+            completion = f"{output_text}{self.tokenizer.eos_token or ''}"
+
+            prompt_ids = self.tokenizer(
+                prompt,
+                truncation=True,
+                max_length=self.config.max_seq_length,
+                add_special_tokens=False,
+            )["input_ids"]
+            completion_ids = self.tokenizer(
+                completion,
+                truncation=True,
+                max_length=self.config.max_seq_length,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            available_completion_len = max(1, self.config.max_seq_length - len(prompt_ids))
+            completion_ids = completion_ids[:available_completion_len]
+
+            input_ids = prompt_ids + completion_ids
+            attention_mask = [1] * len(input_ids)
+            labels = ([-100] * len(prompt_ids)) + completion_ids
+
+            input_ids_batch.append(input_ids)
+            attention_masks_batch.append(attention_mask)
+            labels_batch.append(labels)
+
+        return {
+            "input_ids": input_ids_batch,
+            "attention_mask": attention_masks_batch,
+            "labels": labels_batch,
+        }
 
     def setup_trainer(self, train_dataset: Dataset, eval_dataset: Optional[Dataset] = None):
-        training_args = TrainingArguments(
-            output_dir=self.config.output_dir,
-            num_train_epochs=self.config.num_train_epochs,
-            per_device_train_batch_size=self.config.per_device_train_batch_size,
-            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-            learning_rate=self.config.learning_rate,
-            warmup_ratio=self.config.warmup_ratio,
-            logging_steps=self.config.logging_steps,
-            save_steps=self.config.save_steps,
-            eval_steps=self.config.eval_steps,
-            save_total_limit=3,
-            evaluation_strategy="steps" if eval_dataset else "no",
-            fp16=False,
-            bf16=True if self.config.bnb_4bit_compute_dtype == "bfloat16" else False,
-            max_grad_norm=0.3,
-            weight_decay=0.0,
-            adam_beta1=0.9,
-            adam_beta2=0.95,
-            adam_epsilon=1e-8,
-            max_steps=-1,
-            lr_scheduler_type="cosine",
-            logging_dir=f"{self.config.output_dir}/logs",
-            report_to=["tensorboard"],
-            load_best_model_at_end=True if eval_dataset else False,
-            metric_for_best_model="eval_loss" if eval_dataset else None,
-            greater_is_better=False if eval_dataset else None,
-            ddp_find_unused_parameters=False,
-            deepspeed=self.config.deepspeed,
-            resume_from_checkpoint=self.config.resume_from_checkpoint,
-            optim="paged_adamw_32bit",
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            dataloader_num_workers=4,
-            dataloader_pin_memory=True,
-        )
+        self._disable_deepspeed_autodetect()
+        self._setup_reporter()
+        training_kwargs = {
+            "output_dir": self.config.output_dir,
+            "num_train_epochs": self.config.num_train_epochs,
+            "per_device_train_batch_size": self.config.per_device_train_batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "learning_rate": self.config.learning_rate,
+            "warmup_ratio": self.config.warmup_ratio,
+            "logging_steps": self.config.logging_steps,
+            "save_steps": self.config.save_steps,
+            "eval_steps": self.config.eval_steps,
+            "save_total_limit": 3,
+            "evaluation_strategy": "steps" if eval_dataset else "no",
+            "fp16": False,
+            "bf16": True if self.config.bnb_4bit_compute_dtype == "bfloat16" else False,
+            "max_grad_norm": 0.3,
+            "weight_decay": 0.0,
+            "adam_beta1": 0.9,
+            "adam_beta2": 0.95,
+            "adam_epsilon": 1e-8,
+            "max_steps": -1,
+            "lr_scheduler_type": "cosine",
+            "logging_dir": f"{self.config.output_dir}/logs",
+            "report_to": self.config.report_to,
+            "run_name": self._resolve_run_name(),
+            "load_best_model_at_end": True if eval_dataset else False,
+            "metric_for_best_model": "eval_loss" if eval_dataset else None,
+            "greater_is_better": False if eval_dataset else None,
+            "ddp_find_unused_parameters": False,
+            "deepspeed": self.config.deepspeed,
+            "resume_from_checkpoint": self.config.resume_from_checkpoint,
+            "optim": "paged_adamw_32bit",
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "dataloader_num_workers": 0,
+            "dataloader_pin_memory": True,
+        }
+        if not self.config.deepspeed:
+            training_kwargs.pop("deepspeed", None)
+        training_args = self._build_training_arguments(training_kwargs)
         
         data_collator = DataCollatorForSeq2Seq(
             tokenizer=self.tokenizer,
@@ -273,6 +373,77 @@ class QLoraQwenTrainer:
         )
         
         logger.info("Trainer配置完成")
+
+    def _resolve_run_name(self) -> str:
+        configured = str(getattr(self.config, "wandb_run_name", "") or "").strip()
+        if configured:
+            return configured
+        return Path(self.config.output_dir).name
+
+    def _setup_reporter(self) -> None:
+        reporters = [str(item).strip().lower() for item in (self.config.report_to or []) if str(item).strip()]
+        if not reporters:
+            self.config.report_to = []
+            return
+
+        if "wandb" in reporters:
+            os.environ.setdefault("WANDB_PROJECT", self.config.wandb_project)
+            os.environ.setdefault("WANDB_RUN_GROUP", "qwen3-8b-lora")
+            os.environ.setdefault("WANDB_NAME", self._resolve_run_name())
+            logger.info(
+                "训练日志将上报到 wandb: project=%s run=%s",
+                os.environ.get("WANDB_PROJECT", ""),
+                os.environ.get("WANDB_NAME", ""),
+            )
+
+    def _disable_deepspeed_autodetect(self) -> None:
+        """在当前环境中禁用 accelerate 对 deepspeed 的自动探测。
+
+        原因：
+        - 当前环境里的 deepspeed 依赖的是 pydantic v1 风格接口
+        - 但环境中实际是 pydantic v2
+        - accelerate 在 Trainer 初始化时会因为“已安装 deepspeed”而尝试导入它
+        - 导入阶段即报错，即使本次训练根本没打算用 deepspeed
+        """
+        os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
+        os.environ["USE_DEEPSPEED"] = "false"
+
+        try:
+            import accelerate.utils.imports as acc_imports
+            import accelerate.utils.other as acc_other
+            import accelerate.accelerator as acc_accelerator
+
+            acc_imports.is_deepspeed_available = lambda: False
+            acc_other.is_deepspeed_available = lambda: False
+            acc_accelerator.is_deepspeed_available = lambda: False
+            logger.info("已禁用 accelerate 对 deepspeed 的自动探测，当前训练将不使用 deepspeed")
+        except Exception as e:
+            logger.warning("禁用 deepspeed 自动探测时出现异常，继续按无 deepspeed 训练: %s", e)
+
+    def _build_training_arguments(self, training_kwargs: Dict[str, Any]) -> TrainingArguments:
+        """兼容不同 transformers 版本的 TrainingArguments 参数名。"""
+        kwargs = dict(training_kwargs)
+        alias_map = {
+            "evaluation_strategy": "eval_strategy",
+        }
+
+        while True:
+            try:
+                return TrainingArguments(**kwargs)
+            except TypeError as exc:
+                message = str(exc)
+                match = re.search(r"unexpected keyword argument '([^']+)'", message)
+                if not match:
+                    raise
+
+                bad_key = match.group(1)
+                replacement = alias_map.get(bad_key)
+                if replacement and replacement not in kwargs:
+                    kwargs[replacement] = kwargs[bad_key]
+                    logger.warning("TrainingArguments 不支持 %s，改用 %s", bad_key, replacement)
+                else:
+                    logger.warning("TrainingArguments 不支持参数 %s，已自动移除", bad_key)
+                kwargs.pop(bad_key, None)
 
     def train(self):
         logger.info("开始训练")

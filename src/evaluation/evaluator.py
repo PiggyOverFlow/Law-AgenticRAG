@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class EvaluationCriterion(Enum):
+    """评估标准枚举"""
     FORMAT_CORRECTNESS = "格式正确性"
     CONTENT_COMPLETENESS = "内容完整性"
     LOGICAL_COHERENCE = "逻辑条理性"
@@ -21,6 +22,7 @@ class EvaluationCriterion(Enum):
 
 @dataclass
 class ExpertReview:
+    """专家评审结果数据类"""
     reviewer_name: str
     reviewer_id: str
     document_type: str
@@ -29,14 +31,17 @@ class ExpertReview:
     reviewed_at: datetime
 
     def get_total_score(self) -> int:
+        """获取总分"""
         return sum(self.scores.values())
 
     def get_average_score(self) -> float:
+        """获取平均分"""
         return self.get_total_score() / len(self.scores)
 
 
 @dataclass
 class LLMJudgeResult:
+    """LLM 评判结果数据类"""
     consistency_check: Dict[str, Any]
     logic_coherence_check: Dict[str, Any]
     overall_score: float
@@ -45,11 +50,22 @@ class LLMJudgeResult:
 
 
 class ExpertReviewSystem:
+    """专家评审系统，管理专家评审流程"""
+    
     def __init__(self):
+        """初始化专家评审系统"""
         self.config = get_config()
         self.reviews: List[ExpertReview] = []
 
     def create_review_form(self, document_type: str) -> str:
+        """创建评审表单
+        
+        Args:
+            document_type: 文书类型
+            
+        Returns:
+            str: 评审表单内容
+        """
         criteria = self.config.evaluation.expert_review.criteria
         
         form = f"""

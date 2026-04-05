@@ -13,6 +13,15 @@ class LLMConfig:
     base_url: str
     temperature: float
     max_tokens: int
+    backend: str = "remote"
+    use_local_model: bool = False
+    local_model_path: str = ""
+    lora_adapter_path: str = ""
+    trust_remote_code: bool = True
+    device_map: str = "auto"
+    load_in_4bit: bool = False
+    torch_dtype: str = "bfloat16"
+    attn_implementation: str = ""
 
 
 @dataclass
@@ -53,6 +62,17 @@ class RetrievalConfig:
 
 
 @dataclass
+class ContrastiveConfig:
+    enabled: bool = False
+    max_focus_terms: int = 6
+    max_trap_terms: int = 6
+    target_hit_bonus: float = 0.05
+    trap_hit_penalty: float = 0.06
+    max_bonus: float = 0.22
+    max_penalty: float = 0.28
+
+
+@dataclass
 class RAGConfig:
     use_ollama: bool = True
     ollama: OllamaConfig = None
@@ -63,6 +83,7 @@ class RAGConfig:
     use_local_model: bool = False
     vector_db: VectorDBConfig = None
     retrieval: RetrievalConfig = None
+    contrastive: ContrastiveConfig = None
 
 
 @dataclass
@@ -204,13 +225,31 @@ class Config:
             config[key] = resolve_value(value)
 
     def _parse_config(self):
-        self.llm = LLMConfig(**self._raw_config["llm"])
+        llm_data = self._raw_config["llm"]
+        self.llm = LLMConfig(
+            primary_model=llm_data["primary_model"],
+            vision_model=llm_data["vision_model"],
+            api_key=llm_data.get("api_key", ""),
+            base_url=llm_data.get("base_url", ""),
+            temperature=llm_data["temperature"],
+            max_tokens=llm_data["max_tokens"],
+            backend=llm_data.get("backend", "remote"),
+            use_local_model=llm_data.get("use_local_model", False),
+            local_model_path=llm_data.get("local_model_path", ""),
+            lora_adapter_path=llm_data.get("lora_adapter_path", ""),
+            trust_remote_code=llm_data.get("trust_remote_code", True),
+            device_map=llm_data.get("device_map", "auto"),
+            load_in_4bit=llm_data.get("load_in_4bit", False),
+            torch_dtype=llm_data.get("torch_dtype", "bfloat16"),
+            attn_implementation=llm_data.get("attn_implementation", ""),
+        )
         self.asr = ASRConfig(**self._raw_config["asr"])
         
         vector_db_data = self._raw_config["rag"]["vector_db"]
         vector_db = VectorDBConfig(**vector_db_data)
         
         retrieval = RetrievalConfig(**self._raw_config["rag"]["retrieval"])
+        contrastive = ContrastiveConfig(**self._raw_config["rag"].get("contrastive", {}))
         
         rag_data = self._raw_config["rag"]
         use_ollama = rag_data.get("use_ollama", False)
@@ -227,7 +266,8 @@ class Config:
             reranker_model_path=rag_data.get("reranker_model_path", ""),
             use_local_model=rag_data.get("use_local_model", False),
             vector_db=vector_db,
-            retrieval=retrieval
+            retrieval=retrieval,
+            contrastive=contrastive,
         )
         
         self.database = DatabaseConfig(**self._raw_config["database"])
