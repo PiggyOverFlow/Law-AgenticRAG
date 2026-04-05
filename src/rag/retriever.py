@@ -1,32 +1,27 @@
-from typing import List, Dict, Any, Optional, Literal, Sequence, Callable, Protocol, runtime_checkable
+from typing import List, Dict, Any, Optional, Sequence, Callable, Protocol, runtime_checkable
 import logging
 import re
+import json
 import time
 import math
-from datetime import datetime
 from dataclasses import dataclass, field
+
+import requests
 import torch
 
-import numpy as np
-
 from config import get_config
+from src.llm import LLMBackend
 from src.rag.chunker import LawChunk, RetrievalResult
 from src.rag.vector_db import VectorDBManager
+
+
+logger = logging.getLogger(__name__)
+
+
 # =============================================================================
 # 轻量级 StateGraph 兜底实现 — 兼容 LangGraph StateGraph 接口，零外部依赖
 # =============================================================================
 class _StateGraph:
-    """
-    简化版 StateGraph，替代 langgraph.graph.StateGraph。
-
-    只实现 LegalRAG 所需的最小功能：
-      - add_node(name, func)
-      - add_edge(src, dst)
-      - add_conditional_edges(src, router, mapping)
-      - set_entry_point(name)
-      - compile() -> _CompiledGraph
-    """
-
     def __init__(self, state_class: type):
         self._state_class = state_class
         self._nodes: Dict[str, Callable] = {}
@@ -59,7 +54,6 @@ class _StateGraph:
 
 
 class _END:
-    """替代 langgraph.graph.END，标识图终点。"""
     pass
 
 
@@ -67,10 +61,6 @@ END = _END()
 
 
 class _CompiledGraph:
-    """
-    编译后的图执行器，替代 langgraph.graph.StateGraph.compile()。
-    """
-
     def __init__(
         self,
         state_class: type,
@@ -85,385 +75,842 @@ class _CompiledGraph:
         self._conditional = conditional
         self._entry = entry
 
-    def invoke(self, initial_state) -> dict:
-        """
-        按拓扑顺序执行图，替代 langgraph 的图引擎。
+    def _state_get(self, state, key: str, default: Any = None) -> Any:
+        if isinstance(state, dict):
+            return state.get(key, default)
+        return getattr(state, key, default)
 
-        条件边返回的目标节点名会覆盖后续边的目的。
-        """
-        # 保持 dataclass 实例用于属性访问，末端再转 dict 返回
+    def _state_update(self, state, payload: Any) -> None:
+        if payload is None:
+            return
+
+        if isinstance(payload, dict):
+            data = payload
+        elif hasattr(payload, "__dict__"):
+            data = payload.__dict__
+        else:
+            return
+
+        if isinstance(state, dict):
+            state.update(data)
+            return
+
+        for key, value in data.items():
+            setattr(state, key, value)
+
+    def invoke(self, initial_state) -> dict:
         if isinstance(initial_state, dict):
             state = self._state_class(**initial_state)
         else:
             state = initial_state
 
         current = self._entry
-        visited: set[str] = set()
+        steps = 0
+        visit_counts: Dict[str, int] = {}
+        configured_limit = self._state_get(state, "graph_max_steps")
+        fallback_limit = max(8, int(self._state_get(state, "max_iterations", 5)) * 6)
+        max_steps = max(1, int(configured_limit or fallback_limit))
 
-        while current and current not in visited:
-            visited.add(current)
+        while current:
             if isinstance(current, _END):
+                break
+
+            steps += 1
+            if steps > max_steps:
+                logger.warning("StateGraph 提前终止：超过最大执行步数 %s", max_steps)
+                if isinstance(state, dict):
+                    state["graph_terminated_reason"] = "max_steps_exceeded"
+                    state["graph_steps"] = steps - 1
+                    state["graph_visit_counts"] = dict(visit_counts)
                 break
 
             node_func = self._nodes.get(current)
             if node_func is None:
                 break
 
-            # 执行节点（传入 dataclass 以支持属性访问）
+            visit_counts[current] = visit_counts.get(current, 0) + 1
             result = node_func(state)
-            if result is not None:
-                # 将节点返回值合并回 state（dict 和 dataclass 均支持 update）
-                if hasattr(state, "__dict__"):
-                    state.__dict__.update(result if isinstance(result, dict) else {})
-                else:
-                    state.update(result if isinstance(result, dict) else {})
+            self._state_update(state, result)
 
-            # 条件边路由
             if current in self._conditional:
                 router, mapping = self._conditional[current]
                 next_key = router(state)
                 current = mapping.get(next_key, next_key)
                 continue
 
-            # 常规边
             next_list = self._edges.get(current, [])
             current = next_list[0] if next_list else None
 
-        # 返回 dict 格式（兼容原有接口）
-        return state.__dict__ if hasattr(state, "__dict__") else dict(state)
+        if isinstance(state, dict):
+            state["graph_steps"] = min(steps, max_steps)
+            state["graph_visit_counts"] = dict(visit_counts)
+            return dict(state)
+
+        return state.__dict__
 
 
-# 为保持外部接口一致，提供别名
 StateGraph = _StateGraph
 
 
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# LangChain 兼容 Embeddings Protocol — 替代 langchain_core.embeddings，零外部依赖
-# =============================================================================
 @runtime_checkable
 class Embeddings(Protocol):
-    """LangChain Embeddings 协议接口，与 langchain_core.embeddings.Embeddings 完全兼容。"""
-
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        """批量嵌入文档。"""
         ...
 
     def embed_query(self, text: str) -> List[float]:
-        """单条查询嵌入。"""
         ...
 
 
-# =============================================================================
-# BM25 稀疏检索器 — 基于 jieba 分词 + OKAPI BM25 公式
-# =============================================================================
-class BM25SparseRetriever:
-    """
-    纯 Python 实现的 BM25 稀疏检索器。
-
-    使用 jieba 中文分词 + OKAPI BM25 评分公式，替代传统的倒排索引。
-    可独立于向量数据库使用，作为混合检索的稀疏通道。
-    """
-
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self._corpus: List[str] = []
-        self._corpus_ids: List[str] = []
-        self._doc_len: List[int] = []
-        self._avgdl: float = 0.0
-        self._doc_freqs: Dict[str, int] = {}  # term -> doc count
-        self._num_docs: int = 0
-        self._is_indexed: bool = False
-
-    def index(self, documents: Sequence[Dict[str, Any]]) -> None:
-        """
-        为 documents 构建 BM25 索引。
-
-        Args:
-            documents: 每个元素需包含 'chunk_id' 和 'content' 字段。
-        """
-        import jieba
-
-        self._corpus = []
-        self._corpus_ids = []
-        self._doc_len = []
-        self._doc_freqs = {}
-        self._num_docs = 0
-
-        for doc in documents:
-            content = doc.get("content", "")
-            chunk_id = doc.get("chunk_id", str(len(self._corpus)))
-            tokens = [t for t in jieba.cut(content) if t.strip() and len(t) > 1]
-
-            self._corpus.append(content)
-            self._corpus_ids.append(chunk_id)
-            self._doc_len.append(len(tokens))
-
-            # 统计文档频率
-            seen = set()
-            for t in tokens:
-                if t not in seen:
-                    seen.add(t)
-                    self._doc_freqs[t] = self._doc_freqs.get(t, 0) + 1
-
-        self._num_docs = len(self._corpus)
-        self._avgdl = sum(self._doc_len) / max(self._num_docs, 1)
-        self._is_indexed = True
-        logger.info(f"BM25 索引构建完成：{self._num_docs} 篇文档，{len(self._doc_freqs)} 个词项")
-
-    def search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-        """
-        对 query 执行 BM25 检索。
-
-        Returns:
-            按 BM25 评分降序排列的结果列表，每项包含 chunk_id / score / content 等。
-        """
-        import jieba
-
-        if not self._is_indexed:
-            logger.warning("BM25 索引未构建，返回空结果")
-            return []
-
-        query_tokens = [t for t in jieba.cut(query) if t.strip() and len(t) > 1]
-        if not query_tokens:
-            return []
-
-        scores = []
-        for i, doc_tokens in enumerate(self._corpus):
-            # 重新分词（此处简化：直接用 content 重分）
-            doc_content = self._corpus[i]
-            doc_toks = [t for t in jieba.cut(doc_content) if t.strip() and len(t) > 1]
-            doc_len = self._doc_len[i]
-
-            score = self._bm25_score(query_tokens, doc_toks, doc_len)
-            if score > 0:
-                scores.append((i, score))
-
-        scores.sort(key=lambda x: x[1], reverse=True)
-        results = []
-        for idx, score in scores[:top_k]:
-            results.append({
-                "chunk_id": self._corpus_ids[idx],
-                "score": float(score),
-                "content": self._corpus[idx],
-            })
-        return results
-
-    def _bm25_score(self, query_tokens: List[str], doc_tokens: List[str], doc_len: int) -> float:
-        """OKAPI BM25 评分公式。"""
-        score = 0.0
-        freq: Dict[str, int] = {}
-        for t in doc_tokens:
-            freq[t] = freq.get(t, 0) + 1
-
-        for t in query_tokens:
-            df = self._doc_freqs.get(t, 0)
-            if df == 0:
-                continue
-            tf = freq.get(t, 0)
-            if tf == 0:
-                continue
-
-            idf = math.log((self._num_docs - df + 0.5) / (df + 0.5) + 1)
-            tf_component = (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * doc_len / max(self._avgdl, 1)))
-            score += idf * tf_component
-        return score
-
-
-# =============================================================================
-# LangGraph State — 替代 search() 中的局部变量传递
-# =============================================================================
 @dataclass
-class RetrievalState:
-    """检索流程的共享状态。"""
-    original_query: str = ""
-    filters: dict = field(default_factory=dict)
-
-    # 路由决策
-    need_retrieval: bool = True
-    rewritten_queries: list[str] = field(default_factory=list)
-    primary_query: str = ""
-    use_hybrid: bool = True
-    route_focus: str = "law_article"
-
-    # 检索结果
-    dense_results: list[dict] = field(default_factory=list)
-    sparse_results: list[dict] = field(default_factory=list)
-    fused_results: list[dict] = field(default_factory=list)
-
-    # 最终输出
-    final_results: list[RetrievalResult] = field(default_factory=list)
+class RetrievalTrace:
+    round_index: int
+    thought: str
+    query_used: str
+    retrieval_query: str = ""
+    rewritten_from: Optional[str] = None
+    keywords: List[str] = field(default_factory=list)
+    vector_hits: int = 0
+    kept_hits: int = 0
+    contrast_query: str = ""
+    delta: str = ""
+    focus_terms: List[str] = field(default_factory=list)
+    trap_terms: List[str] = field(default_factory=list)
 
 
-class QueryRewriterRouter:
-    """检索前 Query 改写与路由决策。"""
+@dataclass
+class ContrastiveExample:
+    target_query: str
+    contrast_query: str = ""
+    delta: str = ""
+    focus_terms: List[str] = field(default_factory=list)
+    trap_terms: List[str] = field(default_factory=list)
+    contrast_type: str = "semantic_boundary"
+    enhanced_query: str = ""
 
+
+@dataclass
+class IssuePlan:
+    main_issue: str = ""
+    sub_issues: List[Dict[str, Any]] = field(default_factory=list)
+    retrieval_queries: List[str] = field(default_factory=list)
+    focus_terms: List[str] = field(default_factory=list)
+    ignore_terms: List[str] = field(default_factory=list)
+    primary_claim: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LegalElements:
+    subjects: List[Dict[str, Any]] = field(default_factory=list)
+    relations: List[Dict[str, Any]] = field(default_factory=list)
+    claims: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class QueryAgent:
     def __init__(self):
         self.config = get_config()
+        self.llm_backend = LLMBackend()
 
-    def rewrite_and_route(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        decision = self._decide_rewrite_strategy(query)
-        rewrites = self._execute_rewrite_by_decision(query, decision)
-        route = self._route_query(query, rewrites, decision)
+    def should_rewrite(self, query: str) -> Dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            return {"should_rewrite": False, "reason": "empty_query"}
 
-        metadata_hints = {}
-        law_match = re.findall(r"《([^》]+)》", query)
-        if law_match:
-            metadata_hints["law_name"] = law_match[0]
+        llm_result = self._llm_judge_query_completeness(q)
+        if llm_result is not None:
+            return llm_result
 
-        # 从 query 抽取时间信息作为后置时效过滤输入
-        year_match = re.search(r"(19\d{2}|20\d{2})年", query)
-        if year_match:
-            metadata_hints["event_date"] = f"{year_match.group(1)}-01-01"
-
-        if filters:
-            metadata_hints.update({k: v for k, v in filters.items() if v is not None})
-
+        incomplete_markers = ["这个", "这种", "该", "上述", "前述", "他", "她", "它", "怎么办", "如何处理","如何"]
+        should_rewrite = any(marker in q for marker in incomplete_markers) and len(q) <= 24
         return {
-            "original_query": query,
-            "rewrites": rewrites,
-            "rewrite_primary": rewrites[0] if rewrites else query,
-            "route": route,
-            "metadata_hints": metadata_hints,
-            "rewrite_decision": decision,
+            "should_rewrite": should_rewrite,
+            "reason": "heuristic_incomplete_query" if should_rewrite else "heuristic_complete_query",
         }
 
-    def _decide_rewrite_strategy(self, query: str) -> Dict[str, Any]:
-        """
-        Agentic 决策阶段：只负责判断“是否有必要改写”，不执行改写。
-        使用 LLM 动态判断 query 是否需要改写。
-        """
-        q = query.strip()
+    def rewrite_query(self, query: str, force: bool = False) -> str:
+        q = (query or "").strip()
         if not q:
-            return {
-                "should_rewrite": False,
-                "action": "skip_rewrite",
-                "reason": "empty_query",
-                "signals": {"agentic_decision": False},
-            }
+            return q
+
+        if not force:
+            decision = self.should_rewrite(q)
+            if not decision.get("should_rewrite", False):
+                return q
+
+        rewritten = self._llm_rewrite_query(q)
+        if rewritten:
+            return rewritten
+
+        fallback = q
+        fallback = fallback.replace("怎么办", "适用哪些法律条款以及如何处理")
+        fallback = fallback.replace("怎么判", "司法实践中如何认定与裁判")
+        if fallback == q:
+            fallback = f"{q} 相关法律条文 司法解释 适用要点"
+        return re.sub(r"\s+", " ", fallback).strip()
+
+    def extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        llm_keywords = self._llm_extract_keywords(q, max_keywords=max_keywords)
+        if llm_keywords:
+            return llm_keywords
+
+        return self._heuristic_extract_keywords(q, max_keywords=max_keywords)
+
+    def build_contrastive_example(
+        self,
+        query: str,
+        legal_elements: Optional[LegalElements] = None,
+        claim: Optional[Dict[str, Any]] = None,
+    ) -> ContrastiveExample:
+        q = (query or "").strip()
+        if not q:
+            return ContrastiveExample(target_query="")
+
+        llm_example = self._llm_build_contrastive_example(q, legal_elements=legal_elements, claim=claim)
+        if llm_example:
+            return llm_example
+
+        return self._heuristic_build_contrastive_example(q, legal_elements=legal_elements, claim=claim)
+
+    def extract_legal_elements(self, query: str, context: str = "") -> LegalElements:
+        q = (query or "").strip()
+        if not q:
+            return LegalElements()
+
+        llm_elements = self._llm_extract_legal_elements(q, context=context)
+        if llm_elements:
+            return llm_elements
+
+        return self._heuristic_extract_legal_elements(q, context=context)
+
+    def plan_issue_queries(
+        self,
+        query: str,
+        context: str = "",
+        legal_elements: Optional[LegalElements] = None,
+    ) -> IssuePlan:
+        q = (query or "").strip()
+        if not q:
+            return IssuePlan()
+
+        if legal_elements is None:
+            legal_elements = self.extract_legal_elements(q, context=context)
+
+        llm_plan = self._llm_plan_issue_queries(q, context=context, legal_elements=legal_elements)
+        if llm_plan:
+            return llm_plan
+
+        return self._heuristic_plan_issue_queries(q, context=context, legal_elements=legal_elements)
+
+    def _llm_judge_query_completeness(self, query: str) -> Optional[Dict[str, Any]]:
+        prompt = (
+            "你是法律检索查询分析器。判断 query 是否信息完整，是否需要先改写。"
+            "若包含模糊指代、上下文缺失、语义过短，建议改写。"
+            "只输出 JSON：{\"should_rewrite\": bool, \"reason\": \"...\"}。\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.1, max_tokens=200)
+        if not data:
+            return None
+        return {
+            "should_rewrite": bool(data.get("should_rewrite", False)),
+            "reason": str(data.get("reason", "llm_decision")),
+        }
+
+    def _llm_rewrite_query(self, query: str) -> Optional[str]:
+        prompt = (
+            "你是法律检索改写器。将 query 改写成更完整、更可检索的一句话，"
+            "保持原意，不添加新事实。只输出 JSON：{\"rewrite\": \"...\"}。\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.2, max_tokens=256)
+        if not data:
+            return None
+        rewritten = str(data.get("rewrite", "")).strip()
+        return rewritten or None
+
+    def _llm_extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        prompt = (
+            "你是法律检索的事实要素抽取器。目标是输出高信息密度的检索要素，而不是宽泛领域词。\n"
+            "请从用户问题中抽取：\n"
+            "1) dispute_cause: 争议案由（可为空）\n"
+            "2) evidence_have: 已有证据（如转账记录、合同、病历、聊天记录）\n"
+            "3) evidence_missing: 缺失证据（如无借条、无签字）\n"
+            "4) legal_focus: 具体法律判断点（如举证责任、合同成立、过错认定、时效）\n"
+            "5) facts: 关键事实动作（如未付款、拒不履行、解除合同）\n"
+            "输出 JSON：\n"
+            "{\"dispute_cause\":\"...\",\"evidence_have\":[...],\"evidence_missing\":[...],\"legal_focus\":[...],\"facts\":[...]}\n"
+            "约束：\n"
+            "- 不要输出泛化词（如：法律、纠纷、处理、相关规定）\n"
+            "- 优先输出可区分条文的细粒度词组（2-10字）\n"
+            f"- 最多输出 {max_keywords} 个最终要素\n"
+            f"query: {query}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.1, max_tokens=256)
+        if not data:
+            return []
+
+        candidates: List[str] = []
+
+        # 兼容老格式：{"keywords": [...]} 或 {"elements": [...]}。
+        for legacy_field in ("keywords", "elements"):
+            raw = data.get(legacy_field, [])
+            if isinstance(raw, list):
+                candidates.extend([str(x) for x in raw])
+
+        cause = data.get("dispute_cause") or data.get("争议案由")
+        if isinstance(cause, str) and cause.strip():
+            candidates.append(cause)
+
+        for field in ("evidence_have", "evidence_missing", "legal_focus", "facts"):
+            value = data.get(field)
+            if isinstance(value, list):
+                candidates.extend([str(x) for x in value])
+
+        if not candidates:
+            return []
+
+        return self._post_process_terms(candidates, max_keywords=max_keywords)
+
+    def _llm_extract_legal_elements(self, query: str, context: str = "") -> Optional[LegalElements]:
+        prompt = (
+            "你是法律案件结构化分析器。请从问题与上下文中抽取主体、主体关系、请求项。只输出 JSON。\n"
+            "格式：\n"
+            "{\n"
+            '  "subjects":[{"name":"...","type":"自然人/公司/机构/其他","role":"..."}],\n'
+            '  "relations":[{"from":"...","to":"...","type":"...","description":"..."}],\n'
+            '  "claims":[{"claimant":"...","against":"...","type":"...","object":"...","basis":"...","priority":1}]\n'
+            "}\n"
+            "约束：\n"
+            "- role 必须尽量体现法律身份，如债务人、借款人、受让人、保证人、股东、公司等\n"
+            "- relations 描述法律关系，不要只写自然语言叙事\n"
+            "- claims 是谁向谁主张什么，priority 越小越优先\n"
+            f"问题: {query}\n"
+            f"上下文: {context}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.1, max_tokens=800)
+        if not data:
+            return None
+        return self._normalize_legal_elements(data)
+
+    def _llm_build_contrastive_example(
+        self,
+        query: str,
+        legal_elements: Optional[LegalElements] = None,
+        claim: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ContrastiveExample]:
+        contrast_cfg = getattr(self.config.rag, "contrastive", None)
+        max_focus = max(2, int(getattr(contrast_cfg, "max_focus_terms", 6)))
+        max_trap = max(2, int(getattr(contrast_cfg, "max_trap_terms", 6)))
+        subject_context = self._format_legal_elements_for_prompt(legal_elements)
+        claim_context = self._format_claim_for_prompt(claim)
+        prompt = (
+            "你是法律检索中的对比样例构造器。请围绕给定 claim 构造一个“主体关系相近但结论可能不同”的法律对比问题，"
+            "并指出真正决定法条适用分歧的关键差异。\n"
+            "只输出 JSON，字段如下：\n"
+            "{\n"
+            '  "contrast_query": "...",\n'
+            '  "delta": "...",\n'
+            '  "focus_terms": ["..."],\n'
+            '  "trap_terms": ["..."],\n'
+            '  "contrast_type": "法律关系错配/责任主体错配/构成要件错配/证据效力错配/程序阶段错配",\n'
+            '  "enhanced_query": "..."\n'
+            "}\n"
+            "约束：\n"
+            "- contrast_query 必须与原问题高度相似，但检索目标应不同\n"
+            f"- focus_terms 最多 {max_focus} 个，trap_terms 最多 {max_trap} 个\n"
+            "- focus_terms 是应优先关注的法律事实、证据或裁判要点\n"
+            "- trap_terms 是容易误召回的干扰概念、错误法律路径或泛化表述\n"
+            "- 如果存在主体或请求信息，必须优先围绕 claim 里的主体资格、主体关系、请求边界构造对比\n"
+            "- enhanced_query 写成一句检索意图摘要，强调该关注什么、避免什么\n"
+            f"原始问题: {query}\n"
+            f"主体结构: {subject_context}\n"
+            f"核心请求: {claim_context}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.2, max_tokens=512)
+        if not data:
+            return None
+
+        contrast_query = str(data.get("contrast_query", "")).strip()
+        delta = str(data.get("delta", "")).strip()
+        focus_terms = self._post_process_terms(data.get("focus_terms", []), max_keywords=max_focus)
+        trap_terms = self._post_process_terms(data.get("trap_terms", []), max_keywords=max_trap)
+        enhanced_query = str(data.get("enhanced_query", "")).strip()
+        contrast_type = str(data.get("contrast_type", "semantic_boundary")).strip() or "semantic_boundary"
+        if not any([contrast_query, delta, focus_terms, trap_terms, enhanced_query]):
+            return None
+
+        return ContrastiveExample(
+            target_query=query,
+            contrast_query=contrast_query,
+            delta=delta,
+            focus_terms=focus_terms,
+            trap_terms=trap_terms,
+            contrast_type=contrast_type,
+            enhanced_query=enhanced_query or self._compose_enhanced_query(query, delta, focus_terms, trap_terms),
+        )
+
+    def _heuristic_build_contrastive_example(
+        self,
+        query: str,
+        legal_elements: Optional[LegalElements] = None,
+        claim: Optional[Dict[str, Any]] = None,
+    ) -> ContrastiveExample:
+        contrast_cfg = getattr(self.config.rag, "contrastive", None)
+        max_focus = max(2, int(getattr(contrast_cfg, "max_focus_terms", 6)))
+        max_trap = max(2, int(getattr(contrast_cfg, "max_trap_terms", 6)))
+        claim_query = self._build_claim_query(claim)
+        target_query = claim_query or query
+        terms = self.extract_keywords(target_query, max_keywords=max(max_focus + max_trap, 8))
+        focus_terms = terms[:max_focus]
+        trap_terms = self._infer_trap_terms(target_query, max_trap=max_trap)
+        delta = self._infer_delta(target_query, focus_terms, trap_terms)
+        contrast_query = self._infer_contrast_query(target_query, trap_terms)
+
+        return ContrastiveExample(
+            target_query=target_query,
+            contrast_query=contrast_query,
+            delta=delta,
+            focus_terms=focus_terms,
+            trap_terms=trap_terms,
+            contrast_type="heuristic_legal_boundary",
+            enhanced_query=self._compose_enhanced_query(target_query, delta, focus_terms, trap_terms),
+        )
+
+    def _llm_plan_issue_queries(
+        self,
+        query: str,
+        context: str = "",
+        legal_elements: Optional[LegalElements] = None,
+    ) -> Optional[IssuePlan]:
+        subject_context = self._format_legal_elements_for_prompt(legal_elements)
+        prompt = (
+            "你是法律 Agentic-RAG 的争点规划器。请基于主体、主体关系、请求项，先确定主争点和子争点，"
+            "再为每个高优先级 claim 设计检索 query。只输出 JSON。\n"
+            "JSON 格式：\n"
+            "{\n"
+            '  "main_issue": "...",\n'
+            '  "sub_issues": [{"issue":"...","query":"...","priority":1}],\n'
+            '  "retrieval_queries": ["..."],\n'
+            '  "focus_terms": ["..."],\n'
+            '  "ignore_terms": ["..."],\n'
+            '  "primary_claim": {"claimant":"...","against":"...","type":"...","object":"...","basis":"...","priority":1}\n'
+            "}\n"
+            "约束：\n"
+            "- 必须优先围绕 claims 规划，不要只按表面事实拆题\n"
+            "- main_issue 必须是整案最需要优先检索的法律问题\n"
+            "- sub_issues 只保留 2-5 个高价值子争点，priority 越小优先级越高\n"
+            "- retrieval_queries 输出 3-8 条，用于法律法规检索，避免泛化词\n"
+            "- focus_terms 是应重点覆盖的概念；ignore_terms 是应避免被误召回的概念\n"
+            f"问题: {query}\n"
+            f"上下文: {context}\n"
+            f"主体结构: {subject_context}"
+        )
+        data = self._call_llm_json(prompt, temperature=0.2, max_tokens=700)
+        if not data:
+            return None
+
+        main_issue = str(data.get("main_issue", "")).strip()
+        sub_issues = data.get("sub_issues", [])
+        retrieval_queries = data.get("retrieval_queries", [])
+        focus_terms = self._post_process_terms(data.get("focus_terms", []), max_keywords=8)
+        ignore_terms = self._post_process_terms(data.get("ignore_terms", []), max_keywords=8)
+        primary_claim = self._normalize_claim(data.get("primary_claim", {}))
+
+        normalized_sub_issues: List[Dict[str, Any]] = []
+        if isinstance(sub_issues, list):
+            for item in sub_issues[:6]:
+                if not isinstance(item, dict):
+                    continue
+                issue = str(item.get("issue", "")).strip()
+                issue_query = str(item.get("query", "")).strip()
+                priority = item.get("priority", 9)
+                try:
+                    priority = int(priority)
+                except Exception:
+                    priority = 9
+                if not issue and not issue_query:
+                    continue
+                normalized_sub_issues.append(
+                    {"issue": issue, "query": issue_query, "priority": priority}
+                )
+
+        normalized_queries: List[str] = []
+        if isinstance(retrieval_queries, list):
+            for item in retrieval_queries[:10]:
+                value = str(item).strip()
+                if value:
+                    normalized_queries.append(value)
+
+        if not main_issue and normalized_sub_issues:
+            normalized_sub_issues.sort(key=lambda x: (x.get("priority", 9), x.get("issue", "")))
+            main_issue = normalized_sub_issues[0].get("issue", "") or normalized_sub_issues[0].get("query", "")
+
+        if not any([main_issue, normalized_sub_issues, normalized_queries, focus_terms, ignore_terms]):
+            return None
+
+        if main_issue and main_issue not in normalized_queries:
+            normalized_queries.insert(0, main_issue)
+        for item in sorted(normalized_sub_issues, key=lambda x: (x.get("priority", 9), x.get("issue", ""))):
+            issue_query = str(item.get("query", "")).strip()
+            if issue_query and issue_query not in normalized_queries:
+                normalized_queries.append(issue_query)
+
+        return IssuePlan(
+            main_issue=main_issue,
+            sub_issues=normalized_sub_issues,
+            retrieval_queries=normalized_queries[:10],
+            focus_terms=focus_terms,
+            ignore_terms=ignore_terms,
+            primary_claim=primary_claim,
+        )
+
+    def _heuristic_plan_issue_queries(
+        self,
+        query: str,
+        context: str = "",
+        legal_elements: Optional[LegalElements] = None,
+    ) -> IssuePlan:
+        seed = " ".join([query, context]).strip()
+        focus_terms = self.extract_keywords(seed, max_keywords=8)
+        sub_issues: List[Dict[str, Any]] = []
+        retrieval_queries: List[str] = []
+        claims = sorted((legal_elements.claims if legal_elements else []), key=lambda x: x.get("priority", 9))
+        primary_claim = claims[0] if claims else {}
+
+        def add_issue(issue: str, issue_query: str, priority: int) -> None:
+            if not issue and not issue_query:
+                return
+            sub_issues.append({"issue": issue, "query": issue_query, "priority": priority})
+            if issue_query and issue_query not in retrieval_queries:
+                retrieval_queries.append(issue_query)
+
+        if any(k in seed for k in ["借款", "借贷", "本金", "借条"]):
+            add_issue("民间借贷债权本体及本金返还", "民间借贷 借款合同 本金返还 法律依据", 1)
+        if "债权转让" in seed:
+            add_issue("债权转让对债务人的效力", "债权转让 通知债务人 受让人直接起诉 法律依据", 1)
+        if any(k in seed for k in ["时效", "起诉", "催收", "诉讼时效"]):
+            add_issue("诉讼时效起算与中断", "民间借贷 债权转让 诉讼时效 中断 法律依据", 2)
+        if any(k in seed for k in ["利息", "%", "24%", "年利率"]):
+            add_issue("利息与逾期利息支持边界", "民间借贷 年利率24% 逾期利息 是否支持", 1)
+
+        main_issue = ""
+        if sub_issues:
+            sub_issues.sort(key=lambda x: (x.get("priority", 9), x.get("issue", "")))
+            main_issue = sub_issues[0].get("issue", "") or sub_issues[0].get("query", "")
+        elif focus_terms:
+            main_issue = f"{focus_terms[0]} 相关法律适用"
+            retrieval_queries.append(f"{main_issue} 法律依据")
+
+        if main_issue and main_issue not in retrieval_queries:
+            retrieval_queries.insert(0, main_issue)
+        claim_query = self._build_claim_query(primary_claim)
+        if claim_query and claim_query not in retrieval_queries:
+            retrieval_queries.insert(0, claim_query)
+        if claim_query:
+            main_issue = claim_query
+
+        ignore_terms = self._infer_trap_terms(seed, max_trap=6)
+        return IssuePlan(
+            main_issue=main_issue,
+            sub_issues=sub_issues,
+            retrieval_queries=retrieval_queries[:10],
+            focus_terms=focus_terms[:8],
+            ignore_terms=ignore_terms,
+            primary_claim=primary_claim,
+        )
+
+    def _heuristic_extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        candidates: List[str] = []
+
+        # 证据缺失/存在模式：尽量提炼成可检索的短语。
+        for m in re.finditer(r"(?:无|没有|未|缺少)([\u4e00-\u9fa5A-Za-z0-9]{2,12})", query):
+            candidates.append(f"无{m.group(1)}")
+            candidates.append(m.group(1))
+
+        for m in re.finditer(r"(?:只有|仅有|提供了|提交了|持有)([\u4e00-\u9fa5A-Za-z0-9]{2,12})", query):
+            candidates.append(m.group(1))
+
+        split_tokens = [
+            t.strip() for t in re.split(r"[\s,，。；;、:：()（）]+", query)
+            if t.strip() and len(t.strip()) >= 2
+        ]
+        candidates.extend(split_tokens)
+
+        return self._post_process_terms(candidates, max_keywords=max_keywords)
+
+    def _heuristic_extract_legal_elements(self, query: str, context: str = "") -> LegalElements:
+        seed = " ".join([query, context]).strip()
+        subjects: List[Dict[str, Any]] = []
+        relations: List[Dict[str, Any]] = []
+        claims: List[Dict[str, Any]] = []
+
+        def add_subject(name: str, role: str, subject_type: str = "其他") -> None:
+            normalized = str(name or "").strip()
+            if not normalized:
+                return
+            for item in subjects:
+                if item.get("name") == normalized:
+                    if role and not item.get("role"):
+                        item["role"] = role
+                    return
+            subjects.append({"name": normalized, "type": subject_type, "role": role})
+
+        for name in re.findall(r"[张李王赵钱孙周吴郑冯陈褚卫蒋沈韩杨朱秦尤许何吕施孔曹严华金魏陶姜][\u4e00-\u9fa5]{1,2}", seed):
+            add_subject(name, "")
+
+        role_patterns = [
+            ("受让人", r"([\u4e00-\u9fa5]{2,4})作为?受让人"),
+            ("债务人", r"向([\u4e00-\u9fa5]{2,4})起诉"),
+            ("债权人", r"([\u4e00-\u9fa5]{2,4})将这笔债权转让"),
+        ]
+        for role, pattern in role_patterns:
+            for name in re.findall(pattern, seed):
+                add_subject(name, role)
+
+        if "债权转让" in seed and len(subjects) >= 2:
+            relations.append(
+                {
+                    "from": subjects[0]["name"],
+                    "to": subjects[1]["name"],
+                    "type": "债权转让/基础债权关系",
+                    "description": "存在债权转让或基础债权关系",
+                }
+            )
+
+        if "起诉" in seed and len(subjects) >= 2:
+            claims.append(
+                {
+                    "claimant": subjects[-1]["name"],
+                    "against": subjects[0]["name"],
+                    "type": "请求履行债务",
+                    "object": "本金及利息",
+                    "basis": "基础债权关系",
+                    "priority": 1,
+                }
+            )
+
+        return LegalElements(subjects=subjects, relations=relations, claims=claims)
+
+    def _normalize_legal_elements(self, data: Dict[str, Any]) -> Optional[LegalElements]:
+        if not isinstance(data, dict):
+            return None
+        subjects_raw = data.get("subjects", [])
+        relations_raw = data.get("relations", [])
+        claims_raw = data.get("claims", [])
+
+        subjects: List[Dict[str, Any]] = []
+        if isinstance(subjects_raw, list):
+            for item in subjects_raw[:12]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                subjects.append(
+                    {
+                        "name": name,
+                        "type": str(item.get("type", "其他")).strip() or "其他",
+                        "role": str(item.get("role", "")).strip(),
+                    }
+                )
+
+        relations: List[Dict[str, Any]] = []
+        if isinstance(relations_raw, list):
+            for item in relations_raw[:16]:
+                if not isinstance(item, dict):
+                    continue
+                relations.append(
+                    {
+                        "from": str(item.get("from", "")).strip(),
+                        "to": str(item.get("to", "")).strip(),
+                        "type": str(item.get("type", "")).strip(),
+                        "description": str(item.get("description", "")).strip(),
+                    }
+                )
+
+        claims: List[Dict[str, Any]] = []
+        if isinstance(claims_raw, list):
+            for item in claims_raw[:12]:
+                normalized = self._normalize_claim(item)
+                if normalized:
+                    claims.append(normalized)
+
+        return LegalElements(subjects=subjects, relations=relations, claims=claims)
+
+    def _normalize_claim(self, claim: Any) -> Dict[str, Any]:
+        if not isinstance(claim, dict):
+            return {}
+        try:
+            priority = int(claim.get("priority", 9))
+        except Exception:
+            priority = 9
+        normalized = {
+            "claimant": str(claim.get("claimant", "")).strip(),
+            "against": str(claim.get("against", "")).strip(),
+            "type": str(claim.get("type", "")).strip(),
+            "object": str(claim.get("object", "")).strip(),
+            "basis": str(claim.get("basis", "")).strip(),
+            "priority": priority,
+        }
+        if not any([normalized["claimant"], normalized["against"], normalized["type"], normalized["object"]]):
+            return {}
+        return normalized
+
+    def _build_claim_query(self, claim: Optional[Dict[str, Any]]) -> str:
+        if not claim:
+            return ""
+        parts = [
+            str(claim.get("claimant", "")).strip(),
+            "向",
+            str(claim.get("against", "")).strip(),
+            str(claim.get("type", "")).strip(),
+            str(claim.get("object", "")).strip(),
+            str(claim.get("basis", "")).strip(),
+            "法律依据",
+        ]
+        value = " ".join([p for p in parts if p]).strip()
+        return re.sub(r"\s+", " ", value).strip()
+
+    def _format_legal_elements_for_prompt(self, legal_elements: Optional[LegalElements]) -> str:
+        if not legal_elements:
+            return "无"
+        return json.dumps(
+            {
+                "subjects": legal_elements.subjects,
+                "relations": legal_elements.relations,
+                "claims": legal_elements.claims,
+            },
+            ensure_ascii=False,
+        )
+
+    def _format_claim_for_prompt(self, claim: Optional[Dict[str, Any]]) -> str:
+        if not claim:
+            return "无"
+        return json.dumps(claim, ensure_ascii=False)
+
+    def _post_process_terms(self, terms: List[str], max_keywords: int) -> List[str]:
+        cleaned: List[str] = []
+        seen = set()
+
+        for item in terms:
+            token = self._normalize_term(item)
+            if not token:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(token)
+
+        # 优先高信息密度短语：证据缺失/存在、法律动作、长度更长的短语。
+        scored = []
+        for token in cleaned:
+            score = 1.0
+            if token.startswith(("无", "未", "缺少")):
+                score += 0.5
+            if len(token) >= 4:
+                score += 0.25
+            if any(ch.isdigit() for ch in token):
+                score += 0.2
+            scored.append((score, token))
+
+        scored.sort(key=lambda x: (-x[0], -len(x[1]), x[1]))
+        return [token for _, token in scored[:max_keywords]]
+
+    def _infer_trap_terms(self, query: str, max_trap: int) -> List[str]:
+        candidates: List[str] = []
+        mapping = {
+            "借款": ["货款", "代付款", "往来款"],
+            "借贷": ["买卖货款", "投资款", "代付款"],
+            "劳动": ["劳务关系", "合作关系", "承揽"],
+            "解除劳动合同": ["协商解除", "自动离职", "劳务终止"],
+            "交通事故": ["工伤", "意外事件", "治安案件"],
+            "违约": ["侵权", "不当得利", "缔约过失"],
+            "保证": ["共同借款", "债务加入", "代偿"],
+            "夫妻共同债务": ["个人债务", "公司债务", "职务行为"],
+            "仲裁": ["直接起诉", "行政复议", "调解协议"],
+            "转账记录": ["付款凭证", "报销", "货款结算"],
+            "借条": ["收据", "对账单", "付款申请"],
+        }
+        for key, values in mapping.items():
+            if key in query:
+                candidates.extend(values)
+        if not candidates:
+            candidates = ["一般付款纠纷", "普通合同争议", "无关程序规则"]
+        return self._post_process_terms(candidates, max_keywords=max_trap)
+
+    def _infer_delta(self, query: str, focus_terms: List[str], trap_terms: List[str]) -> str:
+        focus = "、".join(focus_terms[:4]) or "关键构成要件"
+        trap = "、".join(trap_terms[:3]) or "表面相近但法律性质不同的路径"
+        return (
+            f"检索时应优先围绕{focus}识别真正决定责任与法条适用的事实，"
+            f"避免被{trap}等表面相似但法律性质不同的干扰信息带偏。"
+        )
+
+    def _infer_contrast_query(self, query: str, trap_terms: List[str]) -> str:
+        trap = trap_terms[0] if trap_terms else "其他法律关系"
+        return f"{query} 但争议焦点实际属于{trap}时应如何认定"
+
+    def _compose_enhanced_query(
+        self,
+        query: str,
+        delta: str,
+        focus_terms: List[str],
+        trap_terms: List[str],
+    ) -> str:
+        parts = [query]
+        if focus_terms:
+            parts.append("重点关注：" + "、".join(focus_terms))
+        if trap_terms:
+            parts.append("避免混淆：" + "、".join(trap_terms))
+        if delta:
+            parts.append("差异提示：" + delta)
+        return "；".join(parts)
+
+    def _normalize_term(self, term: str) -> str:
+        token = re.sub(r"\s+", "", str(term or "")).strip()
+        token = token.strip("，。；;、:：()（）[]【】{}\"'“”‘’")
+        if len(token) < 2 or len(token) > 14:
+            return ""
+        if self._is_low_information_token(token):
+            return ""
+        return token
+
+    def _is_low_information_token(self, token: str) -> bool:
+        low_info = {
+            "法律", "法规", "条文", "规定", "相关", "问题", "情况", "处理", "如何", "怎么办",
+            "纠纷", "案件", "起诉", "诉讼", "请求", "支持", "认定", "成立", "是否",
+        }
+        if token in low_info:
+            return True
+        # 纯数字或非常短的功能词，不作为检索要素。
+        if token.isdigit():
+            return True
+        return False
+
+    def _call_llm_json(self, prompt: str, temperature: float, max_tokens: int) -> Optional[Dict[str, Any]]:
+        if not self.llm_backend.is_available():
+            return None
 
         try:
-            import requests
-
-            base_url = str(self.config.llm.base_url).rstrip("/")
-            model = self.config.llm.primary_model
-            api_key = self.config.llm.api_key
-
-            prompt = (
-                "你是一个法律检索系统的 Query 路由分析 Agent。\n"
-                f"分析问题：【{q}】\n"
-                "请判断该查询是否需要大模型改写。如果它是短而不依赖上下文的专业词汇（如故意伤害罪）或已经是明确完整的事实，则不需要改写 (false)，避免过度发散；"
-                "如果它包含代词、模糊指代（如“这种情况”）、省略了主体/客体，或者高度依赖上文语境才能检索，则需要改写 (true)。\n"
-                "请严格输出 JSON，包含两个字段：\n"
-                '{"should_rewrite": boolean, "reason": "分析原因"}'
-            )
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0.1,
-                    "max_tokens": 150,
-                    "messages": [
-                        {"role": "system", "content": "你必须且只输出标准的 JSON，不能包含别的文字。"},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-                timeout=10,
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            data = self._extract_json_object(content)
-
-            should_rewrite = bool(data.get("should_rewrite", False))
-            return {
-                "should_rewrite": should_rewrite,
-                "action": "contextual_rewrite" if should_rewrite else "skip_rewrite",
-                "reason": str(data.get("reason", "llm_decision_to_rewrite" if should_rewrite else "llm_decision_to_skip")),
-                "signals": {"agentic_decision": True},
-            }
-        except Exception as e:
-            logger.warning(f"决策 Agent 调用失败: {e}，回退到保守策略：不改写")
-            return {
-                "should_rewrite": False,
-                "action": "skip_rewrite",
-                "reason": "llm_fallback_decision",
-                "signals": {"agentic_decision": False},
-            }
-
-    def _execute_rewrite_by_decision(self, query: str, decision: Dict[str, Any]) -> List[str]:
-        if not decision.get("should_rewrite", False):
-            return [query]
-        return self._rewrite_with_llm(query)
-
-    def _rewrite_with_llm(self, query: str) -> List[str]:
-        # 优先尝试 LLM 生成多路改写，失败时回退到规则改写
-        try:
-            import requests
-
-            base_url = str(self.config.llm.base_url).rstrip("/")
-            model = self.config.llm.primary_model
-            api_key = self.config.llm.api_key
-
-            if not base_url or not model or not api_key:
-                raise ValueError("LLM 配置不完整")
-
-            prompt = (
-                "你是法律检索查询改写器。请输出严格 JSON，字段 rewrites 为字符串数组，"
-                "包含 2-4 个中文改写，覆盖：关键词扩展、法律术语标准化、同义问法。"
-                "要求：与原始语义严格等价，不得引入新的案由、争议焦点或额外事实。"
-                f"原始问题：{query}"
-            )
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0.2,
-                    "max_tokens": 500,
-                    "messages": [
-                        {"role": "system", "content": "你只输出 JSON，不要输出其他文本。"},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
+            content = self.llm_backend.generate(
+                messages=[
+                    {"role": "system", "content": "你只能输出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
                 timeout=20,
             )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            data = self._extract_json_object(content)
-            rewrites = [str(x).strip() for x in data.get("rewrites", []) if str(x).strip()]
-            if rewrites:
-                return list(dict.fromkeys([query] + rewrites))[:4]
+            return self._extract_json_object(content)
         except Exception as e:
-            logger.warning(f"Query 改写 LLM 调用失败，使用规则回退: {e}")
-
-        normalized = query
-        normalized = normalized.replace("怎么判", "法律责任如何认定")
-        normalized = normalized.replace("怎么办", "适用法律条款与处理路径")
-        normalized = normalized.replace("赔多少", "损害赔偿责任范围与计算标准")
-
-        fallback = [
-            query,
-            f"{query} 适用法律条款",
-            f"{normalized}",
-            f"{query} 司法解释",
-        ]
-        return list(dict.fromkeys([x.strip() for x in fallback if x.strip()]))[:4]
+            logger.warning(f"QueryAgent 调用 LLM 失败，使用规则回退: {e}")
+            return None
 
     def _extract_json_object(self, text: str) -> Dict[str, Any]:
-        import json
-
-        stripped = text.strip()
+        stripped = (text or "").strip()
         if stripped.startswith("```"):
             stripped = stripped.strip("`")
             stripped = stripped.replace("json", "", 1).strip()
@@ -471,7 +918,7 @@ class QueryRewriterRouter:
         try:
             return json.loads(stripped)
         except Exception:
-            match = re.search(r"\{[\s\S]*\}", text)
+            match = re.search(r"\{[\s\S]*\}", text or "")
             if not match:
                 return {}
             try:
@@ -479,72 +926,16 @@ class QueryRewriterRouter:
             except Exception:
                 return {}
 
-    def _route_query(
-        self,
-        original_query: str,
-        rewrites: List[str],
-        decision: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        text = " ".join([original_query] + rewrites)
-        short_query = self._is_short_query(original_query)
-        decision = decision or self._decide_rewrite_strategy(original_query)
-
-        need_retrieval = True
-        if any(x in text for x in ["你好", "谢谢", "再见", "hi", "hello"]):
-            need_retrieval = False
-
-        if any(x in text for x in ["案例", "判例", "类案", "裁判"]):
-            focus = "case"
-        elif any(x in text for x in ["事实", "证据", "时间线", "经过", "行为"]):
-            focus = "fact_extraction"
-        else:
-            focus = "law_article"
-
-        keywords = [
-            token for token in re.split(r"[\s,，。；;、:：()（）]+", original_query)
-            if token and len(token) >= 2
-        ]
-
-        return {
-            "need_retrieval": need_retrieval,
-            "focus": focus,
-            "keywords": keywords[:12],
-            "use_hybrid": True,  # 强制开启混合检索，短文本专业词更需要 BM25 的精确召回补充
-            "rewrite_mode": "contextual" if decision.get("should_rewrite") else "skip",
-            "rewrite_reason": decision.get("reason", "unknown"),
-            "rewrite_action": decision.get("action", "skip_rewrite"),
-        }
-
-    def _is_short_query(self, query: str) -> bool:
-        q = query.strip()
-        if not q:
-            return True
-
-        tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", q) if t]
-        return len(q) <= 12 or len(tokens) <= 3
-
 
 class EmbeddingModel(Embeddings):
-    """
-    嵌入模型，支持 Ollama API 和本地 HuggingFace BGE 模型。
-
-    继承 langchain_core.embeddings.Embeddings 协议，对外暴露：
-      - embed_documents(texts) -> List[List[float]]  （LangChain 标准批量接口）
-      - embed_query(text) -> List[float]            （LangChain 标准单条接口）
-
-    内部 encode() / encode_single() 保持原有 Ollama 调用逻辑不变。
-    """
-
     def __init__(self):
         self.config = get_config()
         self._init_model()
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        """LangChain Embeddings 协议：批量嵌入文档。"""
         return self.encode(list(texts))
 
     def embed_query(self, text: str) -> List[float]:
-        """LangChain Embeddings 协议：单条查询嵌入。"""
         return self.encode_single(text)
 
     def _init_model(self):
@@ -557,42 +948,31 @@ class EmbeddingModel(Embeddings):
         use_local = self.config.rag.use_local_model
         local_path = self.config.rag.embedding_model_path
         model_name = self.config.rag.embedding_model
-        
+
         if use_local and local_path:
-            logger.info(f"从本地加载嵌入模型: {local_path}")
             model_path = local_path
+            logger.info(f"从本地加载嵌入模型: {model_path}")
         else:
-            logger.info(f"从 Hugging Face 加载嵌入模型: {model_name}")
             model_path = model_name
-        
+            logger.info(f"从 Hugging Face 加载嵌入模型: {model_path}")
+
         try:
-            from transformers import AutoTokenizer, AutoModel
             from pathlib import Path
-            
+            from transformers import AutoTokenizer, AutoModel
+
             if use_local and local_path and not Path(local_path).exists():
-                logger.warning(f"本地模型路径不存在: {local_path}")
-                logger.info(f"回退到 Hugging Face: {model_name}")
                 model_path = model_name
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            self.model = AutoModel.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            
+                logger.warning(f"本地模型路径不存在，回退 Hugging Face: {model_name}")
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
             self.model.eval()
-            
+
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
                 logger.info("使用 GPU 加速嵌入计算")
-            
-            logger.info("BGE 嵌入模型加载成功")
-            
         except Exception as e:
-            logger.error(f"加载 BGE 模型失败: {e}")
+            logger.error(f"加载嵌入模型失败: {e}")
             self.model = None
             self.tokenizer = None
 
@@ -601,122 +981,95 @@ class EmbeddingModel(Embeddings):
             return self._encode_ollama(texts)
 
         if self.model is None or self.tokenizer is None:
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
-        
+            dim = int(self.config.rag.vector_db.dimension)
+            return [[0.0] * dim for _ in texts]
+
         try:
             encoded_input = self.tokenizer(
                 texts,
                 padding=True,
                 truncation=True,
                 max_length=512,
-                return_tensors='pt'
+                return_tensors="pt",
             )
-            
+
             if torch.cuda.is_available():
                 encoded_input = {k: v.cuda() for k, v in encoded_input.items()}
-            
+
             with torch.no_grad():
                 model_output = self.model(**encoded_input)
-                # BGE-M3 通常使用 [CLS] token 或 mean pooling
                 embeddings = model_output.last_hidden_state[:, 0]
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            
+
             return embeddings.cpu().numpy().tolist()
-            
         except Exception as e:
             logger.error(f"编码失败: {e}")
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
+            dim = int(self.config.rag.vector_db.dimension)
+            return [[0.0] * dim for _ in texts]
 
     def _encode_ollama(self, texts: List[str]) -> List[List[float]]:
-        import requests
-        import time
-        embeddings = []
-        
-        # 预处理：过滤出有效的文本，避免发向服务器导致崩溃
-        import re
-        valid_texts = []
-        for t in texts:
-            if t and t.strip():
-                # 过滤掉无法见字符、极度生僻的控制字符（这些可能导致 LLM 分词出 NaN）
-                cleaned_t = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', t)
-                valid_texts.append(cleaned_t)
-            else:
-                valid_texts.append("")
-                
-        # 提取真正需要发送的非空文本
-        texts_to_send = [t for t in valid_texts if t]
-        
-        if not texts_to_send:
-            return [[0.0] * self.config.rag.vector_db.dimension for _ in texts]
-            
-        # 使用独立的 Session 并禁用 Keep-Alive，防止长连接引起的 Ollama HTTP 500
+        dim = int(self.config.rag.vector_db.dimension)
+        cleaned_texts = []
+        for text in texts:
+            if not text or not text.strip():
+                cleaned_texts.append("")
+                continue
+            sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
+            cleaned_texts.append(sanitized)
+
+        non_empty = [t for t in cleaned_texts if t]
+        if not non_empty:
+            return [[0.0] * dim for _ in texts]
+
         headers = {"Connection": "close"}
-        
+
         try:
-            # 尝试使用最新的 /api/embed (支持批量编码)
-            # Ollama 对于非常大的批量可能会超时，甚至在后端崩溃并返回 500
-            # 减小发送批次大小，由上层的批处理保护
             with requests.Session() as session:
                 response = session.post(
                     f"{self.base_url}/api/embed",
-                    json={"model": self.model_name, "input": texts_to_send},
+                    json={"model": self.model_name, "input": non_empty},
                     headers=headers,
-                    timeout=60 # 重新增加一些超时时间
+                    timeout=60,
                 )
             if response.status_code == 200:
                 valid_embeddings = response.json().get("embeddings", [])
-                
-                # 重新映射回包含空字符串的原始列表顺序
-                return_embeddings = []
-                v_idx = 0
-                for t in valid_texts:
-                    if t and t.strip() and v_idx < len(valid_embeddings):
-                        return_embeddings.append(valid_embeddings[v_idx])
-                        v_idx += 1
+                mapped = []
+                valid_idx = 0
+                for text in cleaned_texts:
+                    if text and valid_idx < len(valid_embeddings):
+                        mapped.append(valid_embeddings[valid_idx])
+                        valid_idx += 1
                     else:
-                        return_embeddings.append([0.0] * self.config.rag.vector_db.dimension)
-                return return_embeddings
-            else:
-                logger.warning(f"Ollama /api/embed 发生异常: HTTP {response.status_code}，尝试降级为逐条请求")
+                        mapped.append([0.0] * dim)
+                return mapped
         except Exception as e:
-            logger.warning(f"Ollama /api/embed 发生异常: {e}，尝试降级为逐条请求")
-            
-        # 降级到逐条循环请求方案
-        for text in texts:
-            if not text or not text.strip():
-                # 处理空字符串，避免 Ollama 因为空 prompt 返回 500
-                embeddings.append([0.0] * self.config.rag.vector_db.dimension)
+            logger.warning(f"Ollama 批量编码失败，降级逐条编码: {e}")
+
+        embeddings = []
+        for text in cleaned_texts:
+            if not text:
+                embeddings.append([0.0] * dim)
                 continue
-                
-            retry_count = 0
-            while retry_count < 3:
+
+            emb = None
+            for _ in range(3):
                 try:
                     with requests.Session() as session:
                         response = session.post(
                             f"{self.base_url}/api/embeddings",
                             json={"model": self.model_name, "prompt": text},
                             headers=headers,
-                            timeout=15 # 设置超时，避免卡死死锁
+                            timeout=20,
                         )
-                    
                     if response.status_code == 200:
-                        embeddings.append(response.json()["embedding"])
+                        emb = response.json().get("embedding")
                         break
-                    else:
-                        # 如遇到500等错误，可能引擎过载，等待一下再重试
-                        logger.warning(f"Ollama 编码警告: HTTP {response.status_code}，将在 10 秒后重试...")
-                        time.sleep(5)
-                        retry_count += 1
-                        
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"Ollama 连接超时/失败，正在重试 ({retry_count}/3): {e}")
-                    time.sleep(5)
-                    
-            if retry_count == 3:
-                logger.error(f"Ollama 编码彻底失败 ({len(text)} 字符)")
-                embeddings.append([0.0] * self.config.rag.vector_db.dimension)
-                
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+            embeddings.append(emb if emb else [0.0] * dim)
+
         return embeddings
 
     def encode_single(self, text: str) -> List[float]:
@@ -724,524 +1077,949 @@ class EmbeddingModel(Embeddings):
 
 
 class Reranker:
-    def __init__(self):
-        self.config = get_config()
-        self._ollama_rerank_supported: Optional[bool] = None
-        self._init_model()
+    """
+    关键词重排器。
 
-    def _init_model(self):
-        if self.config.rag.use_ollama:
-            self.base_url = self.config.rag.ollama.base_url
-            self.model_name = self.config.rag.ollama.reranker_model
-            logger.info(f"使用 Ollama 加载重排序模型: {self.model_name}")
-            return
+    核心规则：
+    1. 关键词权重采用候选集内的自适应区分度（类似 IDF），高频词自动降权。
+    2. 多关键词共同命中时给予阶梯奖励，增强“证据组合”信号。
+    3. 距离越小越相关，最终按距离升序排序。
+    """
 
-        use_local = self.config.rag.use_local_model
-        local_path = self.config.rag.reranker_model_path
-        model_name = self.config.rag.reranker_model
-        
-        if use_local and local_path:
-            logger.info(f"从本地加载重排序模型: {local_path}")
-            model_path = local_path
-        else:
-            logger.info(f"从 Hugging Face 加载重排序模型: {model_name}")
-            model_path = model_name
-
-    def rerank(self, query: str, chunks: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    def rerank(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        top_k: int,
+        keywords: Optional[List[str]] = None,
+        contrastive_example: Optional[ContrastiveExample] = None,
+    ) -> List[Dict[str, Any]]:
         if not chunks:
             return []
 
-        if self.config.rag.use_ollama:
-            return self._rerank_ollama(query, chunks)[:top_k]
-
-        model = getattr(self, "model", None)
-        tokenizer = getattr(self, "tokenizer", None)
-        if model is None or tokenizer is None:
-            for chunk in chunks:
-                # 若无重排模型，回退到原始检索向量分（一般为 0.6~0.9 左右），避免暴露仅有 0.01 左右的 RRF 排序分
-                chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            sorted_chunks = sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
-            return sorted_chunks[:top_k]
-
-        try:
-            pairs = [[query, chunk["content"]] for chunk in chunks]
-            with torch.no_grad():
-                inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
-                if torch.cuda.is_available():
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
-                
-                scores = model(**inputs).logits.view(-1,).float()
-                scores = torch.sigmoid(scores).cpu().numpy().tolist()
-
-            for chunk, score in zip(chunks, scores):
-                chunk["rerank_score"] = score
-
-            sorted_chunks = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
-            return sorted_chunks[:top_k]
-
-        except Exception as e:
-            logger.error(f"重排序失败: {e}")
-            for chunk in chunks:
-                chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            sorted_chunks = sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
-            return sorted_chunks[:top_k]
-
-    def _rerank_ollama(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        import requests
-
-        # 标准 Ollama 默认不一定支持 /api/rerank。
-        # 这里优先尝试 rerank 端点；若返回 404，自动回退到 /api/generate 打分重排。
-        try:
-            if self._ollama_rerank_supported is not False:
-                response = requests.post(
-                    f"{self.base_url}/api/rerank",
-                    json={
-                        "model": self.model_name,
-                        "query": query,
-                        "documents": [c["content"] for c in chunks]
-                    },
-                    timeout=20
-                )
-
-                if response.status_code == 200:
-                    self._ollama_rerank_supported = True
-                    results = response.json().get("results", [])
-                    for res in results:
-                        idx = res.get("index")
-                        if isinstance(idx, int) and 0 <= idx < len(chunks):
-                            chunks[idx]["rerank_score"] = float(res.get("relevance_score", 0.0))
-                    for chunk in chunks:
-                        if "rerank_score" not in chunk:
-                            chunk["rerank_score"] = float(chunk.get("original_score", chunk.get("score", 0.0)))
-                    return sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)
-
-                if response.status_code == 404:
-                    self._ollama_rerank_supported = False
-                    logger.warning("Ollama 不支持 /api/rerank，已切换为 /api/generate 重排模式")
-                else:
-                    logger.warning(f"Ollama /api/rerank 异常: HTTP {response.status_code}，尝试 generate 重排")
-
-            return self._rerank_with_ollama_generate(query, chunks)
-        except Exception as e:
-            logger.error(f"Ollama 重排序异常: {e}")
-            return self._rerank_with_ollama_generate(query, chunks)
-
-    def _rerank_with_ollama_generate(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        import requests
-
-        headers = {"Connection": "close"}
-        with requests.Session() as session:
-            for chunk in chunks:
-                prompt = self._build_rerank_prompt(query, str(chunk.get("content", "")))
-
-                score = None
-                for attempt in range(2):
-                    try:
-                        response = session.post(
-                            f"{self.base_url}/api/generate",
-                            json={
-                                "model": self.model_name,
-                                "prompt": prompt,
-                                "stream": False,
-                                "options": {
-                                    "temperature": 0,
-                                    "num_predict": 8,
-                                }
-                            },
-                            headers=headers,
-                            timeout=25,
-                        )
-                        if response.status_code == 200:
-                            text = str(response.json().get("response", ""))
-                            score = self._parse_score(text)
-                            break
-
-                        # 429/5xx 做一次轻量重试
-                        if response.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                            time.sleep(0.2)
-                            continue
-                        break
-                    except Exception:
-                        if attempt == 0:
-                            time.sleep(0.2)
-                            continue
-                        break
-
-                base_score = float(chunk.get("original_score", chunk.get("score", 0.0)))
-                if score is None:
-                    chunk["rerank_score"] = base_score
-                else:
-                    # 仍保留向量分作为先验，避免生成式评分抖动。
-                    chunk["rerank_score"] = (0.8 * base_score) + (0.2 * score)
-
-                # 避免高并发短间隔请求打满 Ollama
-                time.sleep(0.05)
-
-        return sorted(chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-
-    def _build_rerank_prompt(self, query: str, document: str) -> str:
-        return (
-            "你是法律检索重排器。请评估 Document 对 Query 的相关性，"
-            "只输出 0 到 1 之间的小数，不要输出其它内容。\n"
-            f"Query: {query}\n"
-            f"Document: {document}\n"
-            "Score:"
+        ranked = []
+        normalized_keywords = self._normalize_keywords(keywords or [])
+        contrast_cfg = getattr(get_config().rag, "contrastive", None)
+        normalized_focus = self._normalize_keywords(
+            (contrastive_example.focus_terms if contrastive_example else []) or []
         )
+        normalized_traps = self._normalize_keywords(
+            (contrastive_example.trap_terms if contrastive_example else []) or []
+        )
+        query_profile = self._build_query_profile(
+            query=query,
+            keywords=normalized_keywords,
+            focus_terms=normalized_focus,
+        )
+        target_hit_bonus = float(getattr(contrast_cfg, "target_hit_bonus", 0.05))
+        trap_hit_penalty = float(getattr(contrast_cfg, "trap_hit_penalty", 0.06))
+        max_bonus = float(getattr(contrast_cfg, "max_bonus", 0.22))
+        max_penalty = float(getattr(contrast_cfg, "max_penalty", 0.28))
+        text_blobs = [self._build_text_blob(c) for c in chunks]
 
-    def _parse_score(self, text: str) -> Optional[float]:
-        match = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        try:
-            score = float(match.group(0))
-            # 兼容输出 0-100 的情况
-            if score > 1.0:
-                score = score / 100.0
-            if score < 0.0:
-                score = 0.0
-            if score > 1.0:
-                score = 1.0
-            return score
-        except Exception:
-            return None
+        keyword_df: Dict[str, int] = {}
+        keyword_idf: Dict[str, float] = {}
+        candidate_count = len(text_blobs)
+        for kw in normalized_keywords:
+            df = sum(1 for text in text_blobs if kw in text)
+            keyword_df[kw] = df
+            # 平滑 IDF：在当前候选集内出现越少，区分度越高。
+            keyword_idf[kw] = math.log((candidate_count + 1) / (df + 1)) + 1.0
 
-    def _fallback_rerank(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """当外部 rerank 不可用时，使用词项覆盖率 + 初始分数进行稳健降级。"""
-        terms = self._extract_terms(query)
-        term_count = max(len(terms), 1)
+        # 高频词（在大多数候选中出现）自动降权，避免 Stop-word Trap。
+        effective_keywords = []
+        for kw in normalized_keywords:
+            ratio = keyword_df.get(kw, 0) / max(1, candidate_count)
+            if ratio >= 0.65:
+                continue
+            effective_keywords.append(kw)
 
-        for chunk in chunks:
-            base_score = float(chunk.get("original_score", chunk.get("score", 0.0)))
-            doc = " ".join([
+        # 若全部被判定为高频词，则保留区分度最高的少量词，避免完全失去重排信号。
+        if not effective_keywords and normalized_keywords:
+            effective_keywords = sorted(
+                normalized_keywords,
+                key=lambda x: keyword_idf.get(x, 0.0),
+                reverse=True,
+            )[:3]
+
+        for idx, chunk in enumerate(chunks):
+            base_distance = float(chunk.get("score", 9999.0))
+            text_blob = text_blobs[idx]
+            metadata = chunk.get("metadata") or {}
+            path_text = " ".join(
+                [
+                    str(metadata.get("structure_path_text", "")),
+                    str(metadata.get("structure_hierarchy_path", "")),
+                    str(metadata.get("structure_locator", "")),
+                ]
+            ).lower()
+
+            matched_keywords = [kw for kw in effective_keywords if kw in text_blob]
+            specificity_sum = sum(keyword_idf.get(kw, 0.0) for kw in matched_keywords)
+            coverage = len(matched_keywords) / max(1, len(effective_keywords))
+            focus_hits = [kw for kw in normalized_focus if kw in text_blob]
+            trap_hits = [kw for kw in normalized_traps if kw in text_blob]
+            path_hits = [kw for kw in effective_keywords if kw in path_text]
+            path_focus_hits = [kw for kw in normalized_focus if kw in path_text]
+            path_match_score = min(
+                0.20,
+                0.04 * len(path_hits) + 0.03 * len(path_focus_hits),
+            )
+            legal_priority_score, legal_priority_reasons = self._compute_legal_priority(
+                metadata=metadata,
+                query_profile=query_profile,
+            )
+
+            # 自适应奖励：区分度越高、命中越多，奖励越大；上限防止过度改写排序。
+            keyword_boost = min(
+                0.35,
+                0.06 * specificity_sum + 0.04 * max(0, len(matched_keywords) - 1) + 0.02 * coverage,
+            )
+            contrastive_bonus = min(max_bonus, target_hit_bonus * len(focus_hits))
+            contrastive_penalty = min(max_penalty, trap_hit_penalty * len(trap_hits))
+
+            adjusted_distance = (
+                base_distance
+                - keyword_boost
+                - path_match_score
+                - legal_priority_score
+                - contrastive_bonus
+                + contrastive_penalty
+            )
+
+            item = dict(chunk)
+            item["raw_distance"] = base_distance
+            item["keyword_hits"] = matched_keywords
+            item["keyword_boost"] = keyword_boost 
+            item["path_hits"] = path_hits
+            item["path_focus_hits"] = path_focus_hits
+            item["path_match_score"] = path_match_score
+            item["legal_priority_score"] = legal_priority_score
+            item["legal_priority_reasons"] = legal_priority_reasons
+            item["focus_hits"] = focus_hits
+            item["trap_hits"] = trap_hits
+            item["contrastive_bonus"] = contrastive_bonus
+            item["contrastive_penalty"] = contrastive_penalty
+            item["rerank_score"] = adjusted_distance
+            item["score"] = base_distance
+            item["keyword_idf"] = {k: round(keyword_idf.get(k, 0.0), 3) for k in matched_keywords}
+            item["effective_keywords"] = effective_keywords
+            ranked.append(item)
+
+        ranked.sort(key=lambda x: float(x.get("rerank_score", x.get("score", 9999.0))))
+        return ranked[:top_k]
+
+    def _build_text_blob(self, chunk: Dict[str, Any]) -> str:
+        metadata = chunk.get("metadata") or {}
+        return " ".join(
+            [
                 str(chunk.get("law_name", "")),
                 str(chunk.get("article_num", "")),
                 str(chunk.get("content", "")),
-            ]).lower()
+                str(metadata.get("retrieval_text", "")),
+                str(metadata.get("context_text", "")),
+                str(metadata.get("structure_path_text", "")),
+                str(metadata.get("structure_locator", "")),
+            ]
+        ).lower()
 
-            hit = 0
-            for t in terms:
-                if t and t in doc:
-                    hit += 1
-            lexical_score = hit / term_count
+    def _normalize_keywords(self, keywords: List[str]) -> List[str]:
+        low_info = {
+            "法律", "法规", "条文", "规定", "相关", "问题", "情况", "处理", "如何", "怎么办",
+            "纠纷", "案件", "起诉", "诉讼", "请求", "支持", "认定", "成立", "是否",
+        }
+        low_info_lower = {x.lower() for x in low_info}
+        dedup = []
+        seen = set()
+        for item in keywords:
+            kw = re.sub(r"\s+", "", str(item or "")).strip().lower()
+            if len(kw) < 2 or kw in seen:
+                continue
+            if kw in low_info_lower:
+                continue
+            seen.add(kw)
+            dedup.append(kw)
+        return dedup
 
-            # 稳健融合：保留向量相似度主导，同时用词项命中修正排序。
-            chunk["rerank_score"] = (0.9 * base_score) + (0.1 * lexical_score)
+    def _build_query_profile(
+        self,
+        query: str,
+        keywords: List[str],
+        focus_terms: List[str],
+    ) -> Dict[str, Any]:
+        query_text = " ".join([str(query or ""), " ".join(keywords), " ".join(focus_terms)]).lower()
 
-        return sorted(chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+        domain_markers = {
+            "finance_amc": ["金融资产管理公司", "不良贷款", "国有银行", "资产管理公司", "amc"],
+            "consumer_prepaid": ["预付式消费", "预付卡", "消费者", "经营者", "充值卡"],
+            "sale_contract": ["买卖合同", "买卖", "货物", "交付", "价款"],
+            "execution": ["执行", "被执行人", "司法赔偿", "国家赔偿", "财产调查"],
+            "labor": ["劳动", "用人单位", "工资", "解除劳动合同"],
+            "company": ["公司", "股东", "法定代表人", "出资"],
+            "private_lending": ["民间借贷", "借款", "出借人", "本金", "利息"],
+            "limitation": ["诉讼时效", "时效中断", "中断"],
+            "contract_general": ["合同编", "合同", "债权转让", "让与人", "受让人", "债务人", "通知义务"],
+        }
 
-    def _extract_terms(self, query: str) -> List[str]:
-        tokens = [t.strip().lower() for t in re.split(r"[\s,，。；;、:：()（）]+", query) if t.strip()]
-        if tokens:
-            return list(dict.fromkeys(tokens))[:16]
+        active_domains = {
+            domain
+            for domain, markers in domain_markers.items()
+            if any(marker.lower() in query_text for marker in markers)
+        }
 
-        # 中文无空格时回退到双字词
-        chars = [query[i:i + 2].lower() for i in range(0, max(len(query) - 1, 1))]
-        return list(dict.fromkeys([c for c in chars if c.strip()]))[:16]
+        return {
+            "text": query_text,
+            "active_domains": active_domains,
+        }
+
+    def _compute_legal_priority(
+        self,
+        metadata: Dict[str, Any],
+        query_profile: Dict[str, Any],
+    ) -> tuple[float, List[str]]:
+        law_name = str(metadata.get("law_name", "")).lower()
+        category = str(metadata.get("category", "")).lower()
+        level = str(metadata.get("level", "")).lower()
+        scope = str(metadata.get("applicability_scope", "")).lower()
+        tags = [str(tag).lower() for tag in (metadata.get("tags", []) or [])]
+        blob = " ".join([law_name, category, level, scope, " ".join(tags)])
+        active_domains = set(query_profile.get("active_domains", set()) or set())
+
+        score = 0.0
+        reasons: List[str] = []
+
+        # 通用规范优先：法律本体和合同编通则优先于专项解释。
+        if "民法典" in law_name:
+            score += 0.08
+            reasons.append("民法典基础规范优先")
+        if "合同编通则" in law_name or ("合同编" in law_name and "通则" in law_name):
+            score += 0.08
+            reasons.append("合同编通则优先")
+        elif "合同编" in law_name:
+            score += 0.05
+            reasons.append("合同编规则前置")
+        if "司法解释" in level or "解释" in law_name:
+            score += 0.03
+            reasons.append("司法解释具有直接适用价值")
+
+        if "private_lending" in active_domains and "民间借贷" in blob:
+            score += 0.06
+            reasons.append("命中民间借贷场景")
+        if "limitation" in active_domains and "诉讼时效" in blob:
+            score += 0.06
+            reasons.append("命中诉讼时效场景")
+        if "contract_general" in active_domains and any(term in blob for term in ["债权转让", "让与人", "受让人", "债务人"]):
+            score += 0.05
+            reasons.append("命中债权转让一般规则")
+
+        special_domains = {
+            "finance_amc": (["金融资产管理公司", "不良贷款", "国有银行", "资产管理公司"], 0.11, "金融不良资产专项规则后置"),
+            "consumer_prepaid": (["预付式消费", "预付卡", "经营者", "消费者"], 0.10, "预付式消费专项规则后置"),
+            "sale_contract": (["买卖合同", "买卖"], 0.06, "买卖合同专项规则后置"),
+            "execution": (["执行", "司法赔偿", "国家赔偿", "财产调查", "被执行人"], 0.12, "执行/赔偿专项规则后置"),
+            "labor": (["劳动", "用人单位"], 0.08, "劳动专项规则后置"),
+            "company": (["公司", "股东"], 0.07, "公司专项规则后置"),
+        }
+
+        for domain, (markers, penalty, reason) in special_domains.items():
+            if any(marker.lower() in blob for marker in markers) and domain not in active_domains:
+                score -= penalty
+                reasons.append(reason)
+
+        # 限幅，避免优先级规则完全覆盖语义相关性。
+        score = max(-0.18, min(0.18, score))
+        return round(score, 4), reasons
+
 
 class LegalRAG:
     def __init__(self):
         self.config = get_config()
-
         self.embedding_model = EmbeddingModel()
-        self.reranker = Reranker()
-        self.query_router = QueryRewriterRouter()
+        self.query_agent = QueryAgent()
         self.vector_db = VectorDBManager()
+        self.reranker = Reranker()
+        self.llm_backend = LLMBackend()
 
-        # BM25 稀疏检索器（支持 LangChain VectorStore 协议）
-        self.bm25_retriever = BM25SparseRetriever()
-        self._bm25_indexed = False
-
-        self._build_graph()
-
-    def build_index(self, chunks: List[LawChunk], batch_size: int = 32):
+    def build_index(
+        self,
+        chunks: List[LawChunk],
+        batch_size: int = 32,
+        replace_existing_sources: bool = True,
+    ):
         logger.info(f"开始构建索引，共 {len(chunks)} 个 chunks")
+        if replace_existing_sources:
+            source_law_ids = sorted(
+                {
+                    str(chunk.metadata.get("source_law_id") or "").strip()
+                    for chunk in chunks
+                    if str(chunk.metadata.get("source_law_id") or "").strip()
+                }
+            )
+            if source_law_ids:
+                deleted = self.vector_db.delete_chunks_by_source_law_ids(source_law_ids)
+                logger.info("索引写入前已清理 %s 部法律的旧版本，共删除 %s 个片段", len(source_law_ids), deleted)
 
-        # 同时构建向量索引和 BM25 稀疏索引
-        bm25_docs = []
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
-            texts = [chunk.content for chunk in batch_chunks]
-
-            logger.info(f"正在处理批次: {i}/{len(chunks)}")
+            texts = [
+                str(chunk.metadata.get("retrieval_text") or chunk.content or "")
+                for chunk in batch_chunks
+            ]
             embeddings = self.embedding_model.encode(texts)
             self.vector_db.insert_chunks(batch_chunks, embeddings)
-
-            # 同步收集 BM25 文档
-            for chunk in batch_chunks:
-                bm25_docs.append({
-                    "chunk_id": str(chunk.chunk_id),
-                    "content": chunk.content,
-                    "law_name": chunk.law_name,
-                    "article_num": chunk.article_num,
-                })
-
-        # 构建 BM25 索引
-        if bm25_docs:
-            self.bm25_retriever.index(bm25_docs)
-            self._bm25_indexed = True
-
+            logger.info(f"索引写入进度: {min(i + batch_size, len(chunks))}/{len(chunks)}")
         logger.info("索引构建完成")
 
-    # =============================================================================
-    # LangGraph 节点 — 替代 search() 中的各阶段线性处理
-    # =============================================================================
-    def _node_query_rewrite(self, state: RetrievalState) -> RetrievalState:
-        """Query 改写与路由决策。"""
-        plan = self.query_router.rewrite_and_route(state.original_query, state.filters)
-        route = plan.get("route", {})
-        state.need_retrieval = route.get("need_retrieval", True)
-        state.rewritten_queries = plan.get("rewrites", [])
-        state.primary_query = plan.get("rewrite_primary", state.original_query)
-        state.use_hybrid = bool(route.get("use_hybrid", True))
-        state.route_focus = route.get("focus", "law_article")
+    def search(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        legal_elements: Optional[Dict[str, Any]] = None,
+        primary_claim: Optional[Dict[str, Any]] = None,
+    ) -> List[RetrievalResult]:
+        result = self.search_with_trace(query, filters, legal_elements=legal_elements, primary_claim=primary_claim)
+        return result.get("results", [])
 
-        if not state.need_retrieval:
-            logger.info("路由判定无需检索，直接返回空结果")
+    def search_with_trace(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        legal_elements: Optional[Dict[str, Any]] = None,
+        primary_claim: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        original_query = (query or "").strip()
+        if not original_query:
+            return {"results": [], "trace": [], "query_used": "", "keywords": [], "contrastive_example": {}}
 
-        query_tokens = [t for t in re.split(r"[\s,，。；;、:：()（）]+", state.original_query) if t]
-        max_rewrites = 1 if not state.use_hybrid else (2 if (len(state.original_query) <= 8 and len(query_tokens) <= 2) else 4)
-        state.rewritten_queries = state.rewritten_queries[:max_rewrites]
+        merged_filters = filters or {}
+        retrieval_cfg = getattr(self.config.rag, "retrieval", None)
+        contrast_cfg = getattr(self.config.rag, "contrastive", None)
+        top_k_initial = max(1, int(getattr(retrieval_cfg, "top_k_initial", 10)))
+        top_k_final = max(1, int(getattr(retrieval_cfg, "top_k_final", 5)))
+        max_rounds = max(1, int(getattr(retrieval_cfg, "agentic_max_rounds", 3)))
+        min_rounds = max(1, int(getattr(retrieval_cfg, "agentic_min_rounds", 1)))
+        min_rounds = min(min_rounds, max_rounds)
+        min_results_to_stop = max(1, int(getattr(retrieval_cfg, "min_results_to_stop", top_k_final)))
 
-        logger.info(
-            f"改写查询数量: {len(state.rewritten_queries)}，路由焦点: {state.route_focus}，"
-            f"混合检索: {'开启' if state.use_hybrid else '关闭'}"
+        trace: List[RetrievalTrace] = []
+        current_query = original_query
+        previous_query = None
+        final_keywords: List[str] = []
+        total_vector_hits = 0
+        final_reranked_results: List[Dict[str, Any]] = []
+        aggregated_candidates: Dict[str, Dict[str, Any]] = {}
+        use_contrastive = bool(getattr(contrast_cfg, "enabled", False))
+        normalized_elements = (
+            self.query_agent._normalize_legal_elements(legal_elements or {})
+            if legal_elements
+            else None
         )
-        return state
-
-    def _node_dense_search(self, state: RetrievalState) -> RetrievalState:
-        """向量检索（Dense Search）。"""
-        if not state.need_retrieval:
-            return state
-
-        merged = self._merge_filters(state.filters, {})
-        top_k = self.config.rag.retrieval.top_k_initial
-        results = []
-
-        for q in state.rewritten_queries:
-            embedding = self.embedding_model.encode_single(q)
-            dense = self.vector_db.search(embedding, top_k, merged)
-            for item in dense:
-                item["retrieval_channel"] = "dense"
-            results.extend(dense)
-
-        state.dense_results = results
-        return state
-
-    def _node_sparse_search(self, state: RetrievalState) -> RetrievalState:
-        """稀疏检索（BM25）。优先使用独立 BM25 索引，降级到 Milvus keyword_search。"""
-        if not state.need_retrieval or not state.use_hybrid:
-            state.sparse_results = []
-            return state
-
-        top_k = self.config.rag.retrieval.top_k_initial
-        results = []
-
-        for q in state.rewritten_queries:
-            if self._bm25_indexed:
-                # 优先使用独立 BM25 检索器
-                sparse = self.bm25_retriever.search(q, top_k)
-                for item in sparse:
-                    item["retrieval_channel"] = "sparse"
-                results.extend(sparse)
-            else:
-                # 降级到 Milvus keyword_search
-                merged = self._merge_filters(state.filters, {})
-                sparse = self.vector_db.keyword_search(q, top_k, merged)
-                for item in sparse:
-                    item["retrieval_channel"] = "sparse"
-                results.extend(sparse)
-
-        state.sparse_results = results
-        return state
-
-    def _node_fusion(self, state: RetrievalState) -> RetrievalState:
-        """RRF 融合。"""
-        if not state.dense_results and not state.sparse_results:
-            state.fused_results = []
-            return state
-
-        rrf_k = 60
-        fused = {}
-
-        def _ranked(items):
-            return sorted(items, key=lambda x: x.get("score", 0.0), reverse=True)
-
-        for rank_idx, item in enumerate(_ranked(state.dense_results), 1):
-            key = str(item.get("chunk_id", rank_idx))
-            if key not in fused:
-                fused[key] = dict(item)
-                fused[key]["original_score"] = float(item.get("score", 0.0))
-            fused[key]["score"] += 1.0 / (rrf_k + rank_idx)
-            fused[key]["dense_rank"] = rank_idx
-
-        for rank_idx, item in enumerate(_ranked(state.sparse_results), 1):
-            key = str(item.get("chunk_id", rank_idx))
-            if key not in fused:
-                fused[key] = dict(item)
-                fused[key]["original_score"] = float(item.get("score", 0.0))
-            fused[key]["score"] += 0.2 / (rrf_k + rank_idx)
-            fused[key]["sparse_rank"] = rank_idx
-
-        fused_list = sorted(fused.values(), key=lambda x: x.get("score", 0.0), reverse=True)
-        top_k_initial = self.config.rag.retrieval.top_k_initial
-        state.fused_results = fused_list[:top_k_initial * 3]
-        state.fused_results = self._apply_temporal_filter(state.fused_results, {})
-
-        logger.info(
-            f"初步检索到 {len(state.fused_results)} 个结果 "
-            f"(dense={len(state.dense_results)}, sparse={len(state.sparse_results)})"
-        )
-        return state
-
-    def _node_rerank(self, state: RetrievalState) -> RetrievalState:
-        """重排。"""
-        top_k_final = self.config.rag.retrieval.top_k_final
-        reranked = self.reranker.rerank(state.primary_query, state.fused_results, top_k_final)
-
-        retrieval_results = []
-        for idx, result in enumerate(reranked):
-            metadata = dict(result.get("metadata") or {})
-            metadata["route_focus"] = state.route_focus
-            metadata["context_tier"] = self._context_tier_by_rank(idx)
-            metadata["query_rewrite"] = state.primary_query
-
-            chunk = LawChunk(
-                chunk_id=result["chunk_id"],
-                law_name=result["law_name"],
-                article_num=result["article_num"],
-                content=result["content"],
-                level=result["level"],
-                metadata=metadata,
+        normalized_claim = self.query_agent._normalize_claim(primary_claim or {})
+        contrastive_example = (
+            self.query_agent.build_contrastive_example(
+                original_query,
+                legal_elements=normalized_elements,
+                claim=normalized_claim,
             )
-            retrieval_results.append(
-                RetrievalResult(
-                    chunk=chunk,
-                    score=result.get("rerank_score", result.get("score", 0.0)),
-                    rank=idx + 1,
+            if use_contrastive
+            else ContrastiveExample(target_query=original_query)
+        )
+
+        rewrite_decision = self.query_agent.should_rewrite(original_query)
+        if rewrite_decision.get("should_rewrite", False):
+            rewritten = self.query_agent.rewrite_query(original_query, force=True)
+            if rewritten and rewritten != original_query:
+                previous_query = original_query
+                current_query = rewritten
+
+        for round_idx in range(1, max_rounds + 1):
+            thought = (
+                f"第{round_idx}轮：先向量召回 {top_k_initial} 条，再做关键词命中与对比边界微调重排，"
+                "若命中不足则继续改写 query。"
+            )
+            keywords = self.query_agent.extract_keywords(current_query, max_keywords=8)
+            final_keywords = keywords
+            retrieval_query = current_query
+            if use_contrastive and contrastive_example.enhanced_query:
+                retrieval_query = contrastive_example.enhanced_query
+
+            dense = self._dense_search(retrieval_query, merged_filters, top_k_initial)
+            # 每轮先保留更大的候选池，跨轮聚合后再截断为 top_k_final，
+            # 避免“局部前十”过早截断造成有效条文丢失。
+            reranked = self.reranker.rerank(
+                retrieval_query,
+                dense,
+                top_k_initial,
+                keywords=keywords,
+                contrastive_example=contrastive_example if use_contrastive else None,
+            )
+            total_vector_hits += len(dense)
+
+            trace.append(
+                RetrievalTrace(
+                    round_index=round_idx,
+                    thought=thought,
+                    query_used=current_query,
+                    retrieval_query=retrieval_query,
+                    rewritten_from=previous_query,
+                    keywords=keywords,
+                    vector_hits=len(dense),
+                    kept_hits=len(reranked),
+                    contrast_query=contrastive_example.contrast_query,
+                    delta=contrastive_example.delta,
+                    focus_terms=list(contrastive_example.focus_terms),
+                    trap_terms=list(contrastive_example.trap_terms),
                 )
             )
 
-        state.final_results = retrieval_results
-        logger.info(f"最终返回 {len(retrieval_results)} 个结果")
-        return state
+            for item in reranked:
+                key = self._dedup_candidate_key(item)
+                old = aggregated_candidates.get(key)
+                current_rank_score = float(item.get("rerank_score", item.get("score", 9999.0)))
+                old_rank_score = (
+                    float(old.get("rerank_score", old.get("score", 9999.0)))
+                    if old is not None
+                    else 9999.0
+                )
+                if old is None or current_rank_score < old_rank_score:
+                    aggregated_candidates[key] = item
 
-    # =============================================================================
-    # 条件边路由 — 替代 search() 中的 if-else 判断
-    # =============================================================================
-    def _route_after_rewrite(self, state: RetrievalState) -> Literal["dense_search", "rerank"]:
-        if not state.need_retrieval:
-            return "rerank"
-        return "dense_search"
+            final_reranked_results = sorted(
+                aggregated_candidates.values(),
+                key=lambda x: float(x.get("rerank_score", x.get("score", 9999.0))),
+            )[:top_k_final]
 
-    def _route_after_dense(self, state: RetrievalState) -> Literal["sparse_search", "fusion"]:
-        if state.use_hybrid and state.need_retrieval:
-            return "sparse_search"
-        return "fusion"
+            has_enough_results = len(aggregated_candidates) >= min_results_to_stop
+            has_completed_min_rounds = round_idx >= min_rounds
+            if has_completed_min_rounds and has_enough_results:
+                break
 
-    def _route_after_sparse(self, state: RetrievalState) -> Literal["fusion"]:
-        return "fusion"
+            if round_idx >= max_rounds:
+                break
 
-    # =============================================================================
-    # 构建 StateGraph
-    # =============================================================================
-    def _build_graph(self):
-        workflow = StateGraph(RetrievalState)
+            next_query = self.query_agent.rewrite_query(current_query, force=True)
+            if not next_query:
+                next_query = current_query
+            if next_query == current_query:
+                diversified = f"{current_query} 相关法律依据 司法解释".strip()
+                if diversified != current_query:
+                    next_query = diversified
 
-        workflow.add_node("query_rewrite", self._node_query_rewrite)
-        workflow.add_node("dense_search", self._node_dense_search)
-        workflow.add_node("sparse_search", self._node_sparse_search)
-        workflow.add_node("fusion", self._node_fusion)
-        workflow.add_node("rerank", self._node_rerank)
+            if next_query == current_query and has_completed_min_rounds:
+                break
 
-        workflow.add_conditional_edges(
-            "query_rewrite",
-            self._route_after_rewrite,
-            {
-                "dense_search": "dense_search",
-                "rerank": "rerank",
-            },
-        )
+            previous_query = current_query
+            current_query = next_query
 
-        workflow.add_conditional_edges(
-            "dense_search",
-            self._route_after_dense,
-            {
-                "sparse_search": "sparse_search",
-                "fusion": "fusion",
-            },
-        )
-
-        workflow.add_edge("sparse_search", "fusion")
-        workflow.add_edge("fusion", "rerank")
-        workflow.add_edge("rerank", END)
-
-        workflow.set_entry_point("query_rewrite")
-        self._graph = workflow.compile()
-
-    # =============================================================================
-    # 对外接口 — 保持原有签名，内部委托给 Graph
-    # =============================================================================
-    def search(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[RetrievalResult]:
-        logger.info(f"执行检索寻找前50条查询: {query[:50]}...")
-
-        state = RetrievalState(
-            original_query=query,
-            filters=filters or {},
-            need_retrieval=True,
-            rewritten_queries=[],
-            primary_query=query,
-            use_hybrid=True,
+        retrieval_results = self._to_retrieval_results(
+            final_reranked_results,
+            query_used=current_query,
+            keywords=final_keywords,
             route_focus="law_article",
-            dense_results=[],
-            sparse_results=[],
-            fused_results=[],
-            final_results=[],
+            contrastive_example=contrastive_example if use_contrastive else None,
         )
 
-        result = self._graph.invoke(state)
-        return result["final_results"]
+        logger.info(
+            f"Agentic-RAG 完成，轮次: {len(trace)}，召回: {total_vector_hits}，"
+            f"返回: {len(retrieval_results)}"
+        )
 
-    # =============================================================================
-    # 保留的辅助方法 — 供节点调用
-    # =============================================================================
-    def _merge_filters(self, user_filters: Optional[Dict[str, Any]], hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        merged = {}
-        if user_filters:
-            merged.update(user_filters)
-        if hints:
-            merged.update(hints)
-        return merged
+        return {
+            "results": retrieval_results,
+            "trace": [t.__dict__ for t in trace],
+            "query_used": current_query,
+            "keywords": final_keywords,
+            "contrastive_example": contrastive_example.__dict__ if use_contrastive else {},
+        }
 
-    def _apply_temporal_filter(self, results: List[Dict[str, Any]], hints: Dict[str, Any]) -> List[Dict[str, Any]]:
-        event_date = hints.get("event_date") if hints else None
-        if not event_date:
-            return results
+    def answer_with_citations(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        search_result = self.search_with_trace(query, filters)
+        results = search_result.get("results", [])
 
-        event_dt = self._parse_date(event_date)
-        if not event_dt:
-            return results
+        if not results:
+            return {
+                "answer": "未检索到相关法条，建议补充案件主体、行为、时间等关键信息后重试。",
+                "citations": [],
+                "trace": search_result.get("trace", []),
+                "query_used": search_result.get("query_used", query),
+                "keywords": search_result.get("keywords", []),
+            }
 
-        filtered = []
-        for item in results:
-            eff = self._parse_date(str(item.get("effective_date", "")))
-            rep = self._parse_date(str(item.get("repeal_date", "")))
-            if eff and event_dt < eff:
-                continue
-            if rep and event_dt > rep:
-                continue
-            filtered.append(item)
-        return filtered
+        citations = []
+        evidence_items = []
+        for idx, item in enumerate(results, 1):
+            chunk = item.chunk
+            locator = str(chunk.metadata.get("structure_locator", "")).strip()
+            hierarchy_path = str(chunk.metadata.get("structure_hierarchy_path", "")).strip()
+            snippet = chunk.content[:220]
+            citations.append(
+                {
+                    "id": idx,
+                    "law_name": chunk.law_name,
+                    "article_num": chunk.article_num,
+                    "distance": item.score,
+                    "rerank_score": chunk.metadata.get("rerank_score", item.score),
+                    "locator": locator,
+                    "effective_date": chunk.metadata.get("effective_date", ""),
+                    "repeal_date": chunk.metadata.get("repeal_date", ""),
+                    "snippet": snippet,
+                }
+            )
+            evidence_items.append(
+                {
+                    "id": idx,
+                    "law_name": chunk.law_name,
+                    "article_num": chunk.article_num,
+                    "locator": locator,
+                    "hierarchy_path": hierarchy_path,
+                    "snippet": snippet,
+                    "content": chunk.content[:1200],
+                    "keyword_hits": list(chunk.metadata.get("keyword_hits", [])),
+                    "path_hits": list(chunk.metadata.get("path_hits", [])),
+                    "path_focus_hits": list(chunk.metadata.get("path_focus_hits", [])),
+                    "legal_priority_reasons": list(chunk.metadata.get("legal_priority_reasons", [])),
+                }
+            )
+        issue_outline = self._build_issue_outline(query, evidence_items)
+        answer = self._synthesize_answer(query, evidence_items, issue_outline)
+        return {
+            "answer": answer,
+            "citations": citations,
+            "issue_outline": issue_outline,
+            "trace": search_result.get("trace", []),
+            "query_used": search_result.get("query_used", query),
+            "keywords": search_result.get("keywords", []),
+        }
 
-    def _parse_date(self, text: str) -> Optional[datetime]:
-        if not text:
-            return None
-        candidates = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m", "%Y/%m", "%Y"]
-        for fmt in candidates:
-            try:
-                return datetime.strptime(text, fmt)
-            except Exception:
-                continue
-        return None
+    def _dense_search(self, query: str, filters: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
+        embedding = self.embedding_model.encode_single(query)
+        return self.vector_db.search(embedding, top_k, filters)
+
+    def _dedup_candidate_key(self, item: Dict[str, Any]) -> str:
+        chunk_id = str(item.get("chunk_id", "")).strip()
+        if chunk_id:
+            return f"id::{chunk_id}"
+
+        law_name = str(item.get("law_name", "")).strip()
+        article_num = str(item.get("article_num", "")).strip()
+        if law_name or article_num:
+            return f"law::{law_name}::{article_num}"
+
+        content = str(item.get("content", "")).strip()
+        return f"content::{content[:120]}"
+
+    def _to_retrieval_results(
+        self,
+        reranked: List[Dict[str, Any]],
+        query_used: str,
+        keywords: List[str],
+        route_focus: str,
+        contrastive_example: Optional[ContrastiveExample] = None,
+    ) -> List[RetrievalResult]:
+        results: List[RetrievalResult] = []
+        for idx, item in enumerate(reranked, 1):
+            metadata = dict(item.get("metadata") or {})
+            metadata.update(
+                {
+                    "route_focus": route_focus,
+                    "query_rewrite": query_used,
+                    "context_tier": self._context_tier_by_rank(idx - 1),
+                    "keywords": keywords,
+                    "keyword_hits": item.get("keyword_hits", []),
+                    "raw_distance": item.get("raw_distance", item.get("score", 0.0)),
+                    "rerank_score": item.get("rerank_score", item.get("score", 0.0)),
+                    "keyword_boost": item.get("keyword_boost", 0.0),
+                    "path_match_score": item.get("path_match_score", 0.0),
+                    "legal_priority_score": item.get("legal_priority_score", 0.0),
+                    "legal_priority_reasons": item.get("legal_priority_reasons", []),
+                    "focus_hits": item.get("focus_hits", []),
+                    "path_hits": item.get("path_hits", []),
+                    "path_focus_hits": item.get("path_focus_hits", []),
+                    "trap_hits": item.get("trap_hits", []),
+                    "contrastive_bonus": item.get("contrastive_bonus", 0.0),
+                    "contrastive_penalty": item.get("contrastive_penalty", 0.0),
+                }
+            )
+            if contrastive_example is not None:
+                metadata.update(
+                    {
+                        "contrast_query": contrastive_example.contrast_query,
+                        "delta": contrastive_example.delta,
+                        "focus_terms": list(contrastive_example.focus_terms),
+                        "trap_terms": list(contrastive_example.trap_terms),
+                        "contrast_type": contrastive_example.contrast_type,
+                    }
+                )
+
+            chunk = LawChunk(
+                chunk_id=str(item.get("chunk_id", "")),
+                law_name=str(item.get("law_name", "")),
+                article_num=str(item.get("article_num", "")),
+                content=str(item.get("content", "")),
+                level=str(item.get("level", "")),
+                metadata=metadata,
+            )
+            results.append(
+                RetrievalResult(
+                    chunk=chunk,
+                    score=float(item.get("raw_distance", item.get("score", 0.0))),
+                    rank=idx,
+                )
+            )
+        return results
+
+    def _build_issue_outline(self, query: str, evidence_items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """根据 query 和证据命中情况构建争点提纲。"""
+        normalized_query = (query or "").strip()
+        evidence_text = "\n".join(
+            [
+                " ".join(
+                    [
+                        str(item.get("law_name", "")),
+                        str(item.get("article_num", "")),
+                        str(item.get("locator", "")),
+                        str(item.get("hierarchy_path", "")),
+                        str(item.get("snippet", "")),
+                        " ".join(item.get("keyword_hits", [])),
+                        " ".join(item.get("path_hits", [])),
+                        " ".join(item.get("path_focus_hits", [])),
+                    ]
+                )
+                for item in evidence_items[:8]
+            ]
+        )
+        merged_text = f"{normalized_query}\n{evidence_text}"
+        answer_mode = self._detect_answer_mode(normalized_query, merged_text)
+
+        if answer_mode == "criminal_procedure_basis":
+            outline: List[Dict[str, str]] = [
+                {
+                    "title": "问题一：适用情形与法律依据",
+                    "focus": "先说明该问题属于何种刑事程序措施或侦查措施，并列出最直接的法律、司法解释或办案规定依据。",
+                },
+                {
+                    "title": "问题二：启动条件与决定机关",
+                    "focus": "明确由谁决定、在什么条件下可以启动，以及是否需要满足特定程序前提。",
+                },
+                {
+                    "title": "问题三：办理程序与发布要求",
+                    "focus": "按程序步骤说明如何发布、公告、执行或送达，并提示文书、审批、范围等要求。",
+                },
+                {
+                    "title": "结论：直接可引用的法条",
+                    "focus": "简要列出回答该问题最核心的法条和条号，方便用户直接引用。",
+                },
+            ]
+            return outline
+
+        if answer_mode == "legal_basis_lookup":
+            outline = [
+                {
+                    "title": "问题一：直接法律依据",
+                    "focus": "优先回答用户问题对应的核心法条和条号，不展开无关争议。",
+                },
+                {
+                    "title": "问题二：适用条件与限制",
+                    "focus": "简要说明这些法条在什么条件下适用，以及常见的适用边界。",
+                },
+                {
+                    "title": "结论：检索结论与出处",
+                    "focus": "概括最值得引用的规范出处，方便直接用于检索、学习或写作。",
+                },
+            ]
+            return outline
+
+        outline: List[Dict[str, str]] = []
+        outline.append(
+            {
+                "title": "争点一：权利基础与请求主体",
+                "focus": "先判断请求人是否基于现有证据享有主张本金、利息或其他给付请求的资格，明确基础法律关系和请求权来源。",
+            }
+        )
+
+        if self._contains_any(
+            merged_text,
+            ["债权转让", "受让人", "让与人", "转让通知", "通知到达", "债权让与"],
+        ):
+            outline.append(
+                {
+                    "title": "争点二：债权转让及通知效力",
+                    "focus": "分析债权转让是否已经对债务人发生效力，通知到达前后对履行对象、抗辩和受让人请求权的影响。",
+                }
+            )
+
+        if self._contains_any(
+            merged_text,
+            ["时效", "起诉", "诉讼时效", "中断", "届满", "到期后", "何时起诉"],
+        ):
+            outline.append(
+                {
+                    "title": "争点三：诉讼时效与时间线",
+                    "focus": "结合事实中的借款时间、到期时间、通知时间、起诉时间，分析诉讼时效的起算、中断及是否仍在保护期内。",
+                }
+            )
+
+        if self._contains_any(
+            merged_text,
+            ["利息", "利率", "逾期", "借款", "年利率", "违约责任", "LPR", "本金"],
+        ):
+            outline.append(
+                {
+                    "title": "争点四：本金、借期内利息与逾期责任",
+                    "focus": "区分本金、借期内利息、逾期利息或违约责任的请求边界，明确哪些部分可直接按约主张，哪些需要结合司法解释进一步调整。",
+                }
+            )
+
+        if self._contains_any(
+            merged_text,
+            ["抗辩", "抵销", "撤销", "无效", "不存在", "履行", "免责"],
+        ):
+            outline.append(
+                {
+                    "title": "争点五：可能的抗辩与裁判风险",
+                    "focus": "提示债务人可能提出的效力、通知、履行、抗辩或请求范围方面的争议点，并说明其对主张成功率的影响。",
+                }
+            )
+
+        outline.append(
+            {
+                "title": "结论：请求支持范围",
+                "focus": "以简短结论概括哪些请求大概率可获支持，哪些请求需要限缩、拆分或补充事实后再判断。",
+            }
+        )
+        return outline
+
+    def _detect_answer_mode(self, query: str, merged_text: str) -> str:
+        """识别问答任务类型，避免把所有问题都套成民商事争点模板。"""
+        query_text = str(query or "")
+        full_text = str(merged_text or "")
+
+        criminal_markers = [
+            "犯罪嫌疑人", "被告人", "公安机关", "检察院", "人民检察院", "刑事", "侦查",
+            "抓捕", "逮捕", "拘留", "通缉", "通缉令", "悬赏通告", "立案侦查", "追逃",
+            "刑事诉讼法", "刑诉法", "程序规定",
+        ]
+        basis_lookup_markers = [
+            "依据哪些法律条款", "依据哪些法律", "法律依据", "法条依据", "适用哪些条文",
+            "有哪些规定", "如何规定", "条文依据", "规定在哪里", "根据哪些条款",
+        ]
+        civil_request_markers = [
+            "本金", "利息", "违约责任", "赔偿", "偿还", "履行", "借款", "合同", "起诉",
+            "诉讼时效", "债权转让", "请求支持",
+        ]
+
+        if self._contains_any(query_text, criminal_markers) or self._contains_any(full_text, ["刑事诉讼法", "公安机关办理刑事案件程序规定"]):
+            if self._contains_any(query_text, basis_lookup_markers) or self._contains_any(query_text, ["如何发布", "如何办理", "怎么办理", "程序", "发布要求"]):
+                return "criminal_procedure_basis"
+            return "criminal_procedure_basis"
+
+        if self._contains_any(query_text, basis_lookup_markers) and not self._contains_any(query_text, civil_request_markers):
+            return "legal_basis_lookup"
+
+        return "civil_issue_analysis"
+
+    def _synthesize_answer(
+        self,
+        query: str,
+        evidence_items: List[Dict[str, Any]],
+        issue_outline: List[Dict[str, str]],
+    ) -> str:
+        llm_cfg = self.config.llm
+        if not self.llm_backend.is_available():
+            return self._fallback_answer(query, evidence_items, issue_outline)
+
+        evidence_blocks = []
+        for item in evidence_items:
+            reasons = item.get("legal_priority_reasons", [])
+            reason_text = f"优先级提示：{'；'.join(reasons)}\n" if reasons else ""
+            evidence_blocks.append(
+                f"[{item['id']}] {item['law_name']} {item['article_num']}\n"
+                f"体系定位：{item.get('locator') or '未知'}\n"
+                f"父级路径：{item.get('hierarchy_path') or '未知'}\n"
+                f"{reason_text}"
+                f"{item.get('content', '')}"
+            )
+
+        outline_text = "\n".join(
+            [f"- {item['title']}：{item['focus']}" for item in issue_outline]
+        )
+        answer_mode = self._detect_answer_mode(query, f"{query}\n{outline_text}")
+
+        if answer_mode == "criminal_procedure_basis":
+            task_guidance = (
+                "回答必须使用“刑事程序法检索问答”的语气，不要使用民商事请求权分析模板。\n"
+                "不要出现“权利基础与请求主体”“本金、利息”“请求支持范围”等民商事措辞，除非用户问题本身涉及这些内容。\n"
+                "应优先回答：1. 直接法律依据；2. 启动条件和决定机关；3. 办理程序与发布要求；4. 可直接引用的条号。\n"
+            )
+            output_requirements = (
+                "1. 先给出“检索结论”，用 2-4 句直接回答用户问的程序和法条依据。\n"
+                "2. 然后按提纲逐项说明，每一段都尽量引用最直接的法条编号，如 [1][2]。\n"
+                "3. 最后给出“可直接引用的法条”，列出名称和条号。\n"
+            )
+        elif answer_mode == "legal_basis_lookup":
+            task_guidance = (
+                "回答应偏向“法条依据检索说明”，优先列出条文依据和适用条件，不要强行扩展成案件争点裁判分析。\n"
+            )
+            output_requirements = (
+                "1. 先给出“检索结论”，简明回答核心规范依据。\n"
+                "2. 然后按提纲说明直接依据和适用条件。\n"
+                "3. 最后给出“可直接引用的法条”。\n"
+            )
+        else:
+            task_guidance = (
+                "回答必须按争点分段，优先处理请求权基础、时间线、利息边界和裁判风险。\n"
+                "如果证据不足以直接得出结论，请明确写出“现有证据不足以判断”。\n"
+                "涉及金钱给付时，尽量拆分为本金、借期内利息、逾期利息/违约责任分别分析。\n"
+            )
+            output_requirements = (
+                "1. 先给出“争点摘要”，用 2-4 句概括核心结论。\n"
+                "2. 然后逐个争点展开，每个争点单独成段，标题保持与提纲一致。\n"
+                "3. 每一段都尽量引用最直接的法条编号，如 [1][3]。\n"
+                "4. 最后给出“结论与建议”，明确哪些请求大概率支持、哪些需要调整。\n"
+            )
+
+        prompt = (
+            "你是法律分析助手。请严格基于给定证据回答用户问题，并在句末使用 [编号] 引用。\n"
+            "不要编造未提供的法律依据，不要把未命中的规范当作已检索到的依据。\n"
+            f"{task_guidance}\n"
+            f"用户问题：{query}\n\n"
+            "请严格按照以下提纲组织回答：\n"
+            f"{outline_text}\n\n"
+            "输出要求：\n"
+            f"{output_requirements}\n"
+            "证据：\n"
+            + "\n\n".join(evidence_blocks)
+        )
+
+        try:
+            content = self.llm_backend.generate(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是专业法律助手，回答必须引用证据编号。"
+                            "你必须根据问题类型切换回答格式，不能把刑事程序法检索问题套用民商事请求权分析模板。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=min(int(llm_cfg.max_tokens), 1200),
+                timeout=getattr(self.config.performance, "request_timeout", 120),
+            )
+            return content or self._fallback_answer(query, evidence_items, issue_outline)
+        except Exception as e:
+            logger.error(f"基于证据生成回答失败: {e}")
+            return self._fallback_answer(query, evidence_items, issue_outline)
+
+    def _fallback_answer(
+        self,
+        query: str,
+        evidence_items: List[Dict[str, Any]],
+        issue_outline: List[Dict[str, str]],
+    ) -> str:
+        answer_mode = self._detect_answer_mode(query, f"{query}\n" + "\n".join([item.get("title", "") for item in issue_outline]))
+        summary_label = "检索结论" if answer_mode != "civil_issue_analysis" else "争点摘要"
+        lines = [f"问题：{query}", "", f"{summary_label}："]
+        top_refs = [f"[{item['id']}]" for item in evidence_items[:3]]
+        if top_refs:
+            if answer_mode == "civil_issue_analysis":
+                lines.append(
+                    f"现有检索结果显示，本问题可优先围绕 {'、'.join([item['title'] for item in issue_outline[:3]])} 展开，"
+                    f"核心参考依据见 {' '.join(top_refs)}。"
+                )
+            else:
+                lines.append(
+                    f"现有检索结果显示，可优先依据 {' '.join(top_refs)} 回答该问题，并结合命中的法条说明具体适用条件和办理要求。"
+                )
+        else:
+            lines.append("现有检索结果较少，建议补充案件主体、时间线和争议焦点。")
+
+        lines.append("")
+        for section in issue_outline:
+            title = section.get("title", "").strip()
+            focus = section.get("focus", "").strip()
+            lines.append(title)
+            if title.startswith("结论"):
+                if answer_mode == "civil_issue_analysis":
+                    lines.append("现阶段建议优先依据前述命中法条判断请求支持范围，并对利息、时效、通知到达等关键事实做进一步核对。")
+                else:
+                    lines.append("现阶段建议优先引用前述命中法条，并按条文要求说明适用情形、决定机关和办理程序。")
+            else:
+                refs = self._select_issue_citations(title, evidence_items)
+                ref_text = " ".join([f"[{item['id']}]" for item in refs]) or "暂无直接命中条文"
+                lines.append(f"分析重点：{focus}")
+                if refs:
+                    primary = refs[0]
+                    lines.append(
+                        f"当前可优先参考 {primary['law_name']} {primary['article_num']} {ref_text}，"
+                        "并结合条文原文进一步论证。"
+                    )
+                else:
+                    lines.append("当前检索结果中缺少与该争点直接对应的法条，建议补充更明确的争议描述。")
+            lines.append("")
+
+        lines.append("可参考法条：")
+        for item in evidence_items[:5]:
+            lines.append(
+                f"[{item['id']}] {item['law_name']} {item['article_num']} "
+                f"- {item.get('locator') or item.get('hierarchy_path') or '未知定位'}"
+            )
+        lines.append("")
+        lines.append("说明：当前为结构化降级回答，请结合上述法条原文和案件事实进行人工研判。")
+        return "\n".join(lines)
+
+    def _select_issue_citations(
+        self,
+        issue_title: str,
+        evidence_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        selectors = {
+            "权利基础": ["借款", "本金", "债权", "请求", "履行"],
+            "债权转让": ["债权转让", "通知", "受让人", "让与人"],
+            "诉讼时效": ["时效", "中断", "起诉", "期限"],
+            "利息": ["利息", "利率", "逾期", "借款", "LPR"],
+            "抗辩": ["抗辩", "无效", "撤销", "不存在", "履行"],
+            "适用情形": ["通缉", "悬赏", "逃脱", "侦查", "抓捕", "刑事", "公安机关"],
+            "法律依据": ["法律依据", "法条", "条款", "规定", "程序规定", "刑事诉讼法"],
+            "启动条件": ["决定", "批准", "机关", "条件", "发布", "通缉令", "悬赏通告"],
+            "办理程序": ["程序", "发布", "公告", "办理", "通报", "执行", "审批"],
+            "直接法律依据": ["法律依据", "法条", "条款", "规定"],
+            "适用条件": ["条件", "适用", "限制", "前提"],
+            "结论": [],
+        }
+        matched_keywords: List[str] = []
+        for marker, keywords in selectors.items():
+            if marker in issue_title:
+                matched_keywords = keywords
+                break
+
+        ranked: List[Dict[str, Any]] = []
+        for item in evidence_items:
+            haystack = " ".join(
+                [
+                    str(item.get("law_name", "")),
+                    str(item.get("article_num", "")),
+                    str(item.get("locator", "")),
+                    str(item.get("hierarchy_path", "")),
+                    str(item.get("snippet", "")),
+                    " ".join(item.get("keyword_hits", [])),
+                    " ".join(item.get("path_hits", [])),
+                    " ".join(item.get("path_focus_hits", [])),
+                ]
+            )
+            score = sum(1 for keyword in matched_keywords if keyword and keyword in haystack)
+            if score > 0:
+                ranked.append({"score": score, "item": item})
+
+        ranked.sort(key=lambda x: (-x["score"], x["item"]["id"]))
+        if ranked:
+            return [entry["item"] for entry in ranked[:2]]
+        return evidence_items[:1]
+
+    def _contains_any(self, text: str, keywords: List[str]) -> bool:
+        source = str(text or "")
+        return any(keyword in source for keyword in keywords if keyword)
 
     def _context_tier_by_rank(self, rank_index: int) -> int:
         if rank_index == 0:
@@ -1253,7 +2031,7 @@ class LegalRAG:
     def search_by_event(self, event_description: str, event_time: Optional[str] = None) -> List[RetrievalResult]:
         filters = {}
         if event_time:
-            filters["effective_date"] = event_time
+            filters["case_date"] = event_time
         return self.search(event_description, filters)
 
     def get_relevant_laws(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
@@ -1268,14 +2046,16 @@ class LegalRAG:
 
         relevant_laws = []
         for law_name, law_results in law_groups.items():
-            relevant_laws.append({
-                "law_name": law_name,
-                "articles": [r.chunk.article_num for r in law_results],
-                "contents": [r.chunk.content for r in law_results],
-                "max_score": max(r.score for r in law_results)
-            })
+            relevant_laws.append(
+                {
+                    "law_name": law_name,
+                    "articles": [r.chunk.article_num for r in law_results],
+                    "contents": [r.chunk.content for r in law_results],
+                    "min_distance": min(r.score for r in law_results),
+                }
+            )
 
-        relevant_laws.sort(key=lambda x: x["max_score"], reverse=True)
+        relevant_laws.sort(key=lambda x: x["min_distance"])
         return relevant_laws[:top_k]
 
     def get_collection_stats(self) -> Dict[str, Any]:
@@ -1285,40 +2065,17 @@ class LegalRAG:
         logger.warning("重置向量数据库索引")
         self.vector_db.delete_collection()
         self.vector_db = VectorDBManager()
-        self.bm25_retriever = BM25SparseRetriever()
-        self._bm25_indexed = False
-        self._build_graph()
 
-    # =============================================================================
-    # LangChain Retriever 兼容接口 — 将完整检索流程暴露为标准 Retriever
-    # =============================================================================
     def as_retriever(self, top_k: int = 5) -> "HybridLegalRetriever":
-        """
-        将 LegalRAG 的混合检索流程封装为 LangChain 兼容 Retriever。
-
-        Usage:
-            from langchain_core.retrievers import RetrieverLike
-            retriever: RetrieverLike = legal_rag.as_retriever(top_k=5)
-            docs = retriever.invoke("民间借贷 利息计算")
-        """
         return HybridLegalRetriever(self, top_k)
 
 
 class HybridLegalRetriever:
-    """
-    LangChain 兼容的混合检索 Retriever。
-
-    封装 LegalRAG.search()，对外暴露 LangChain RetrieverLike 接口：
-      - invoke(query)           → 同步检索
-      - get_relevant_documents(query) → 别名方法（兼容旧代码）
-    """
-
     def __init__(self, legal_rag: LegalRAG, top_k: int = 5):
         self._rag = legal_rag
         self._top_k = top_k
 
     def invoke(self, query: str) -> List["RetrievedDoc"]:
-        """LangChain Retriever 协议：同步检索。"""
         results = self._rag.search(query)
         return [
             RetrievedDoc(
@@ -1327,7 +2084,7 @@ class HybridLegalRetriever:
                     "law_name": r.chunk.law_name,
                     "article_num": r.chunk.article_num,
                     "level": r.chunk.level,
-                    "score": r.score,
+                    "distance": r.score,
                     "rank": r.rank,
                     **r.chunk.metadata,
                 },
@@ -1336,7 +2093,6 @@ class HybridLegalRetriever:
         ]
 
     def get_relevant_documents(self, query: str) -> List["RetrievedDoc"]:
-        """LangChain 旧版 Retriever 接口（别名）。"""
         return self.invoke(query)
 
     def __call__(self, query: str) -> List["RetrievedDoc"]:
@@ -1344,13 +2100,6 @@ class HybridLegalRetriever:
 
 
 class RetrievedDoc:
-    """
-    轻量级文档对象，替代 langchain_core.documents.Document。
-
-    避免引入 langchain_core 导致的 pydantic 版本冲突，
-    同时保持与 LangChain Document 完全兼容的字段结构。
-    """
-
     def __init__(self, page_content: str, metadata: Optional[dict] = None):
         self.page_content = page_content
         self.metadata = metadata or {}
@@ -1362,5 +2111,4 @@ class RetrievedDoc:
         return self.page_content
 
     def to_langchain_doc(self) -> Dict[str, Any]:
-        """转换为 LangChain Document 格式（lazy import，避免顶层依赖）。"""
         return {"page_content": self.page_content, "metadata": self.metadata}
