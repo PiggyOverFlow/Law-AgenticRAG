@@ -83,7 +83,6 @@ htmlcov/
 .tox/
 
 # Documentation
-docs/
 dataset/
 
 output/
