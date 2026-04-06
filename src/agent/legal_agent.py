@@ -37,6 +37,7 @@ class AgentState(dict):
     template: str = ""
     extracted_facts: dict = field(default_factory=dict)
     contrastive_example: dict = field(default_factory=dict)
+    contrastive_cot: dict = field(default_factory=dict)
     issue_plan: dict = field(default_factory=dict)
     legal_roles: dict = field(default_factory=dict)
     query_strategy: str = "focused"
@@ -302,6 +303,7 @@ class LegalAgent:
         state["retrieved_laws"] = []
         state["law_filter_report"] = {}
         state["contrastive_example"] = {}
+        state["contrastive_cot"] = {}
 
         tool = self.tools["fact_extraction"]
         case_facts = state.get("case_facts")
@@ -343,6 +345,7 @@ class LegalAgent:
         dedup: Dict[str, Dict[str, Any]] = {}
         attempts: List[Dict[str, Any]] = []
         chosen_contrastive: Dict[str, Any] = {}
+        chosen_contrastive_cot: Dict[str, Any] = {}
 
         for idx, query in enumerate(queries[:8], 1):
             if not query.strip():
@@ -384,6 +387,8 @@ class LegalAgent:
 
             if not chosen_contrastive:
                 chosen_contrastive = dict(search_result.get("contrastive_example") or {})
+            if not chosen_contrastive_cot:
+                chosen_contrastive_cot = dict(search_result.get("contrastive_cot") or {})
 
             attempts.append(
                 {
@@ -405,6 +410,7 @@ class LegalAgent:
         logger.info(f"Agentic-RAG 检索轮次: {len(attempts)}，命中条文: {len(retrieved)}")
         state["retrieved_laws"] = retrieved
         state["contrastive_example"] = chosen_contrastive
+        state["contrastive_cot"] = chosen_contrastive_cot
         if retrieved:
             self._record_thought(
                 state,
@@ -420,6 +426,7 @@ class LegalAgent:
             "result": retrieved,
             "agentic_attempts": attempts,
             "contrastive_example": chosen_contrastive,
+            "contrastive_cot": chosen_contrastive_cot,
             "issue_plan": state.get("issue_plan", {}),
             "legal_roles": state.get("legal_roles", {}),
             "iteration": iteration,
@@ -814,6 +821,7 @@ class LegalAgent:
                 "template": state.get("template", ""),
                 "case_facts": state.get("case_facts"),
                 "contrastive_example": state.get("contrastive_example", {}),
+                "contrastive_cot": state.get("contrastive_cot", {}),
                 "issue_plan": state.get("issue_plan", {}),
                 "legal_roles": state.get("legal_roles", {}),
             },
@@ -935,6 +943,7 @@ class LegalAgent:
             template="",
             extracted_facts={},
             contrastive_example={},
+            contrastive_cot={},
             issue_plan={},
             legal_roles={},
             query_strategy="focused",
@@ -967,6 +976,7 @@ class LegalAgent:
         facts = context.get("extracted_facts", {})
         case_facts = context.get("case_facts")
         contrastive = context.get("contrastive_example", {}) or {}
+        contrastive_cot = context.get("contrastive_cot", {}) or {}
         issue_plan = context.get("issue_plan", {}) or {}
         legal_roles = context.get("legal_roles", {}) or {}
 
@@ -993,6 +1003,7 @@ class LegalAgent:
             f"应重点论证：{'、'.join([str(x) for x in focus_terms]) or '无'}\n"
             f"应避免误用：{'、'.join([str(x) for x in trap_terms]) or '无'}"
         )
+        contrastive_cot_block = self._render_contrastive_cot_block(contrastive_cot, laws)
         subject_lines = []
         for item in legal_roles.get("subjects", [])[:12]:
             if isinstance(item, dict):
@@ -1026,6 +1037,7 @@ class LegalAgent:
 4. 格式尽量贴合文书模板，结构完整、用语规范。
 5. 若证据中出现明确利率/期限/本金，必须逐字沿用，不得改写为其他数值。
 6. 涉及利息请求时，必须明确写出计算基数、利率类型（月利率或年利率）、起算时间与截止时间。
+7. 先在内部执行 Contrastive CoT 审查，再将结论融入文书，不要把推理草稿直接写出来。
 
 文书类型：{doc_type}
 用户诉求：{user_request or '无'}
@@ -1051,6 +1063,9 @@ class LegalAgent:
 对比检索提示：
 {contrast_block}
 
+Contrastive CoT 审查骨架：
+{contrastive_cot_block}
+
 事实时间线：
 {chr(10).join(fact_timeline) if fact_timeline else '无'}
 
@@ -1060,6 +1075,62 @@ class LegalAgent:
 文书模板：
 {template or '无模板'}
 """
+
+    def _render_contrastive_cot_block(
+        self,
+        contrastive_cot: Dict[str, Any],
+        laws: List[Dict[str, Any]],
+    ) -> str:
+        cot = contrastive_cot or {}
+        focus_terms = [str(x) for x in (cot.get("focus_terms", []) or []) if str(x).strip()]
+        trap_terms = [str(x) for x in (cot.get("trap_terms", []) or []) if str(x).strip()]
+        steps = cot.get("reasoning_steps", []) or []
+        evidence = cot.get("supporting_evidence", []) or []
+
+        if not evidence and laws:
+            for idx, law in enumerate(laws[:3], 1):
+                metadata = law.get("metadata") or {}
+                evidence.append(
+                    {
+                        "id": idx,
+                        "law_name": law.get("law_name", "未知法律"),
+                        "article_num": law.get("article_num", ""),
+                        "focus_hits": list(metadata.get("focus_hits", []) or []),
+                        "trap_hits": list(metadata.get("trap_hits", []) or []),
+                    }
+                )
+
+        evidence_lines = []
+        for item in evidence[:4]:
+            evidence_lines.append(
+                f"- [{item.get('id', '?')}] {item.get('law_name', '未知法律')} {item.get('article_num', '')}"
+                f" | focus_hits: {'、'.join(item.get('focus_hits', []) or []) or '无'}"
+                f" | trap_hits: {'、'.join(item.get('trap_hits', []) or []) or '无'}"
+            )
+
+        step_lines = []
+        for item in steps:
+            if isinstance(item, dict):
+                step_lines.append(f"- {item.get('step', '步骤')}：{item.get('content', '')}")
+
+        if not step_lines:
+            step_lines = [
+                "- 争点定位：围绕当前主争点确认真正适用的法律关系。",
+                "- 支持依据：优先使用已命中的核心法条和事实支撑结论。",
+                "- 混淆排除：排除与案件关系表面相似但构成要件不同的规范路径。",
+                "- 结论边界：若关键差异无法证明，则文书表述保持克制并提示待补充事实。",
+            ]
+
+        return (
+            f"对比问题：{cot.get('contrast_query') or '无'}\n"
+            f"关键差异：{cot.get('delta') or '无'}\n"
+            f"应重点论证：{'、'.join(focus_terms) or '无'}\n"
+            f"应避免误用：{'、'.join(trap_terms) or '无'}\n"
+            "支持证据：\n"
+            f"{chr(10).join(evidence_lines) if evidence_lines else '- 暂无'}\n"
+            "内部推理步骤：\n"
+            f"{chr(10).join(step_lines)}"
+        )
 
     def _format_law_results(self, results: List[Dict[str, Any]]) -> str:
         if not results:

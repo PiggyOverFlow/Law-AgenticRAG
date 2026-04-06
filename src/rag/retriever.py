@@ -163,6 +163,7 @@ class Embeddings(Protocol):
 
 @dataclass
 class RetrievalTrace:
+    """检索轨迹，记录每次检索的详细信息"""
     round_index: int
     thought: str
     query_used: str
@@ -179,6 +180,7 @@ class RetrievalTrace:
 
 @dataclass
 class ContrastiveExample:
+    """对比学习示例，用于区分相似查询"""
     target_query: str
     contrast_query: str = ""
     delta: str = ""
@@ -190,6 +192,7 @@ class ContrastiveExample:
 
 @dataclass
 class IssuePlan:
+    """问题查询计划，包含主问题、子问题和检索查询"""
     main_issue: str = ""
     sub_issues: List[Dict[str, Any]] = field(default_factory=list)
     retrieval_queries: List[str] = field(default_factory=list)
@@ -200,17 +203,29 @@ class IssuePlan:
 
 @dataclass
 class LegalElements:
+    """法律要素，包含主体、关系和请求权"""
     subjects: List[Dict[str, Any]] = field(default_factory=list)
     relations: List[Dict[str, Any]] = field(default_factory=list)
     claims: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class QueryAgent:
+    """查询智能体，负责查询重写、关键词提取、法律要素提取和查询规划"""
+    
     def __init__(self):
+        """初始化查询智能体"""
         self.config = get_config()
         self.llm_backend = LLMBackend()
 
     def should_rewrite(self, query: str) -> Dict[str, Any]:
+        """判断查询是否需要重写
+        
+        Args:
+            query: 查询文本
+            
+        Returns:
+            Dict[str, Any]: 包含 should_rewrite 和 reason 的字典
+        """
         q = (query or "").strip()
         if not q:
             return {"should_rewrite": False, "reason": "empty_query"}
@@ -227,6 +242,15 @@ class QueryAgent:
         }
 
     def rewrite_query(self, query: str, force: bool = False) -> str:
+        """重写查询文本，使其更完整和具体
+        
+        Args:
+            query: 原始查询文本
+            force: 是否强制重写
+            
+        Returns:
+            str: 重写后的查询文本
+        """
         q = (query or "").strip()
         if not q:
             return q
@@ -248,6 +272,15 @@ class QueryAgent:
         return re.sub(r"\s+", " ", fallback).strip()
 
     def extract_keywords(self, query: str, max_keywords: int = 8) -> List[str]:
+        """从查询中提取关键词
+        
+        Args:
+            query: 查询文本
+            max_keywords: 最大关键词数量
+            
+        Returns:
+            List[str]: 关键词列表
+        """
         q = (query or "").strip()
         if not q:
             return []
@@ -264,6 +297,16 @@ class QueryAgent:
         legal_elements: Optional[LegalElements] = None,
         claim: Optional[Dict[str, Any]] = None,
     ) -> ContrastiveExample:
+        """构建对比学习示例，包含目标词和陷阱词
+        
+        Args:
+            query: 查询文本
+            legal_elements: 法律要素
+            claim: 请求权
+            
+        Returns:
+            ContrastiveExample: 对比学习示例
+        """
         q = (query or "").strip()
         if not q:
             return ContrastiveExample(target_query="")
@@ -275,6 +318,15 @@ class QueryAgent:
         return self._heuristic_build_contrastive_example(q, legal_elements=legal_elements, claim=claim)
 
     def extract_legal_elements(self, query: str, context: str = "") -> LegalElements:
+        """从查询中提取法律要素（主体、关系、请求权）
+        
+        Args:
+            query: 查询文本
+            context: 上下文信息
+            
+        Returns:
+            LegalElements: 法律要素对象
+        """
         q = (query or "").strip()
         if not q:
             return LegalElements()
@@ -291,6 +343,16 @@ class QueryAgent:
         context: str = "",
         legal_elements: Optional[LegalElements] = None,
     ) -> IssuePlan:
+        """规划问题查询，生成多个检索查询以提高召回率
+        
+        Args:
+            query: 原始查询文本
+            context: 上下文信息
+            legal_elements: 法律要素
+            
+        Returns:
+            IssuePlan: 问题查询计划
+        """
         q = (query or "").strip()
         if not q:
             return IssuePlan()
@@ -928,17 +990,37 @@ class QueryAgent:
 
 
 class EmbeddingModel(Embeddings):
+    """嵌入模型，用于将文本转换为向量表示"""
+    
     def __init__(self):
+        """初始化嵌入模型"""
         self.config = get_config()
         self._init_model()
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """将文档列表转换为向量列表
+        
+        Args:
+            texts: 文本列表
+            
+        Returns:
+            List[List[float]]: 向量列表
+        """
         return self.encode(list(texts))
 
     def embed_query(self, text: str) -> List[float]:
+        """将查询文本转换为向量
+        
+        Args:
+            text: 查询文本
+            
+        Returns:
+            List[float]: 向量表示
+        """
         return self.encode_single(text)
 
     def _init_model(self):
+        """初始化嵌入模型"""
         if self.config.rag.use_ollama:
             self.base_url = self.config.rag.ollama.base_url
             self.model_name = self.config.rag.ollama.embedding_model
@@ -977,6 +1059,14 @@ class EmbeddingModel(Embeddings):
             self.tokenizer = None
 
     def encode(self, texts: List[str]) -> List[List[float]]:
+        """将文本列表编码为向量列表
+        
+        Args:
+            texts: 文本列表
+            
+        Returns:
+            List[List[float]]: 向量列表
+        """
         if self.config.rag.use_ollama:
             return self._encode_ollama(texts)
 
@@ -1078,12 +1168,14 @@ class EmbeddingModel(Embeddings):
 
 class Reranker:
     """
-    关键词重排器。
+    关键词重排器，基于关键词匹配和多种评分策略对检索结果进行重排序。
 
     核心规则：
     1. 关键词权重采用候选集内的自适应区分度（类似 IDF），高频词自动降权。
-    2. 多关键词共同命中时给予阶梯奖励，增强“证据组合”信号。
+    2. 多关键词共同命中时给予阶梯奖励，增强"证据组合"信号。
     3. 距离越小越相关，最终按距离升序排序。
+    4. 支持对比学习示例，对目标词给予奖励，对陷阱词给予惩罚。
+    5. 考虑路径匹配和法律优先级，提供更精准的排序。
     """
 
     def rerank(
@@ -1094,6 +1186,18 @@ class Reranker:
         keywords: Optional[List[str]] = None,
         contrastive_example: Optional[ContrastiveExample] = None,
     ) -> List[Dict[str, Any]]:
+        """对检索结果进行重排序
+        
+        Args:
+            query: 查询文本
+            chunks: 候选块列表
+            top_k: 返回结果数量
+            keywords: 关键词列表
+            contrastive_example: 对比学习示例，包含目标词和陷阱词
+            
+        Returns:
+            List[Dict[str, Any]]: 重排序后的结果列表
+        """
         if not chunks:
             return []
 
@@ -1332,7 +1436,10 @@ class Reranker:
 
 
 class LegalRAG:
+    """法律检索增强生成系统，整合向量检索、查询处理和重排序功能"""
+    
     def __init__(self):
+        """初始化法律 RAG 系统"""
         self.config = get_config()
         self.embedding_model = EmbeddingModel()
         self.query_agent = QueryAgent()
@@ -1346,7 +1453,13 @@ class LegalRAG:
         batch_size: int = 32,
         replace_existing_sources: bool = True,
     ):
-        logger.info(f"开始构建索引，共 {len(chunks)} 个 chunks")
+        """构建向量索引
+        
+        Args:
+            chunks: 法律文本块列表
+            batch_size: 批处理大小
+            replace_existing_sources: 是否替换已存在的源
+        """
         if replace_existing_sources:
             source_law_ids = sorted(
                 {
@@ -1377,6 +1490,17 @@ class LegalRAG:
         legal_elements: Optional[Dict[str, Any]] = None,
         primary_claim: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
+        """检索相关法律法规
+        
+        Args:
+            query: 查询文本
+            filters: 过滤条件
+            legal_elements: 法律要素
+            primary_claim: 主要请求权
+            
+        Returns:
+            List[RetrievalResult]: 检索结果列表
+        """
         result = self.search_with_trace(query, filters, legal_elements=legal_elements, primary_claim=primary_claim)
         return result.get("results", [])
 
@@ -1387,9 +1511,27 @@ class LegalRAG:
         legal_elements: Optional[Dict[str, Any]] = None,
         primary_claim: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """检索相关法律法规并返回完整轨迹
+        
+        Args:
+            query: 查询文本
+            filters: 过滤条件
+            legal_elements: 法律要素
+            primary_claim: 主要请求权
+            
+        Returns:
+            Dict[str, Any]: 包含结果、轨迹、查询、关键词等的字典
+        """
         original_query = (query or "").strip()
         if not original_query:
-            return {"results": [], "trace": [], "query_used": "", "keywords": [], "contrastive_example": {}}
+            return {
+                "results": [],
+                "trace": [],
+                "query_used": "",
+                "keywords": [],
+                "contrastive_example": {},
+                "contrastive_cot": {},
+            }
 
         merged_filters = filters or {}
         retrieval_cfg = getattr(self.config.rag, "retrieval", None)
@@ -1518,6 +1660,11 @@ class LegalRAG:
             route_focus="law_article",
             contrastive_example=contrastive_example if use_contrastive else None,
         )
+        contrastive_cot = self._build_contrastive_cot_from_results(
+            query=original_query,
+            results=retrieval_results,
+            contrastive_example=contrastive_example if use_contrastive else None,
+        )
 
         logger.info(
             f"Agentic-RAG 完成，轮次: {len(trace)}，召回: {total_vector_hits}，"
@@ -1530,6 +1677,7 @@ class LegalRAG:
             "query_used": current_query,
             "keywords": final_keywords,
             "contrastive_example": contrastive_example.__dict__ if use_contrastive else {},
+            "contrastive_cot": contrastive_cot,
         }
 
     def answer_with_citations(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1543,6 +1691,8 @@ class LegalRAG:
                 "trace": search_result.get("trace", []),
                 "query_used": search_result.get("query_used", query),
                 "keywords": search_result.get("keywords", []),
+                "contrastive_example": search_result.get("contrastive_example", {}),
+                "contrastive_cot": search_result.get("contrastive_cot", {}),
             }
 
         citations = []
@@ -1581,7 +1731,18 @@ class LegalRAG:
                 }
             )
         issue_outline = self._build_issue_outline(query, evidence_items)
-        answer = self._synthesize_answer(query, evidence_items, issue_outline)
+        contrastive_cot = self._build_contrastive_cot_from_results(
+            query=query,
+            results=results,
+            contrastive_example=search_result.get("contrastive_example", {}),
+            issue_outline=issue_outline,
+        )
+        answer = self._synthesize_answer(
+            query,
+            evidence_items,
+            issue_outline,
+            contrastive_cot=contrastive_cot,
+        )
         return {
             "answer": answer,
             "citations": citations,
@@ -1589,6 +1750,8 @@ class LegalRAG:
             "trace": search_result.get("trace", []),
             "query_used": search_result.get("query_used", query),
             "keywords": search_result.get("keywords", []),
+            "contrastive_example": search_result.get("contrastive_example", {}),
+            "contrastive_cot": contrastive_cot,
         }
 
     def _dense_search(self, query: str, filters: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:
@@ -1818,15 +1981,164 @@ class LegalRAG:
 
         return "civil_issue_analysis"
 
+    def _normalize_contrastive_example_payload(
+        self,
+        contrastive_example: Optional[Any],
+    ) -> Dict[str, Any]:
+        if contrastive_example is None:
+            return {}
+        if isinstance(contrastive_example, ContrastiveExample):
+            return {
+                "target_query": contrastive_example.target_query,
+                "contrast_query": contrastive_example.contrast_query,
+                "delta": contrastive_example.delta,
+                "focus_terms": list(contrastive_example.focus_terms),
+                "trap_terms": list(contrastive_example.trap_terms),
+                "contrast_type": contrastive_example.contrast_type,
+                "enhanced_query": contrastive_example.enhanced_query,
+            }
+        if isinstance(contrastive_example, dict):
+            return {
+                "target_query": str(contrastive_example.get("target_query", "")).strip(),
+                "contrast_query": str(contrastive_example.get("contrast_query", "")).strip(),
+                "delta": str(contrastive_example.get("delta", "")).strip(),
+                "focus_terms": list(contrastive_example.get("focus_terms", []) or []),
+                "trap_terms": list(contrastive_example.get("trap_terms", []) or []),
+                "contrast_type": str(contrastive_example.get("contrast_type", "")).strip(),
+                "enhanced_query": str(contrastive_example.get("enhanced_query", "")).strip(),
+            }
+        return {}
+
+    def _build_contrastive_cot_from_results(
+        self,
+        query: str,
+        results: List[RetrievalResult],
+        contrastive_example: Optional[Any] = None,
+        issue_outline: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        payload = self._normalize_contrastive_example_payload(contrastive_example)
+        focus_terms = [str(x).strip() for x in payload.get("focus_terms", []) if str(x).strip()]
+        trap_terms = [str(x).strip() for x in payload.get("trap_terms", []) if str(x).strip()]
+        issue_titles = [
+            str(item.get("title", "")).strip()
+            for item in (issue_outline or [])
+            if str(item.get("title", "")).strip()
+        ]
+
+        evidence_cards: List[Dict[str, Any]] = []
+        for idx, result in enumerate(results[:4], 1):
+            chunk = result.chunk
+            metadata = chunk.metadata or {}
+            evidence_cards.append(
+                {
+                    "id": idx,
+                    "law_name": chunk.law_name,
+                    "article_num": chunk.article_num,
+                    "locator": str(metadata.get("structure_locator", "")).strip(),
+                    "focus_hits": list(metadata.get("focus_hits", []) or []),
+                    "trap_hits": list(metadata.get("trap_hits", []) or []),
+                    "keyword_hits": list(metadata.get("keyword_hits", []) or []),
+                    "snippet": str(chunk.content or "")[:180],
+                }
+            )
+
+        support_refs = [
+            f"[{item['id']}] {item['law_name']} {item['article_num']}"
+            for item in evidence_cards
+        ]
+        support_text = "；".join(support_refs) if support_refs else "当前无稳定支持法条"
+        issue_text = "；".join(issue_titles[:3]) if issue_titles else "围绕核心法条适用边界展开"
+
+        reasoning_steps = [
+            {
+                "step": "争点定位",
+                "content": (
+                    f"原问题是“{query}”，当前优先围绕 {issue_text} 判断。"
+                    if issue_titles
+                    else f"原问题是“{query}”，需先锁定最直接的法条适用边界。"
+                ),
+            },
+            {
+                "step": "支持依据",
+                "content": f"应优先使用以下命中法条作为正向依据：{support_text}。",
+            },
+            {
+                "step": "混淆排除",
+                "content": (
+                    f"重点关注 {('、'.join(focus_terms) if focus_terms else '案件决定性事实')}；"
+                    f"避免被 {('、'.join(trap_terms) if trap_terms else '表面相似但法律关系不同的概念')} 误导。"
+                ),
+            },
+            {
+                "step": "结论边界",
+                "content": (
+                    f"若关键差异“{payload.get('delta') or '暂无明确 delta'}”无法被现有证据证明，"
+                    "结论应收敛为有限支持或提示证据不足。"
+                ),
+            },
+        ]
+
+        return {
+            "target_query": query,
+            "contrast_query": payload.get("contrast_query", ""),
+            "delta": payload.get("delta", ""),
+            "focus_terms": focus_terms,
+            "trap_terms": trap_terms,
+            "contrast_type": payload.get("contrast_type", ""),
+            "issue_titles": issue_titles[:4],
+            "supporting_evidence": evidence_cards,
+            "reasoning_steps": reasoning_steps,
+        }
+
+    def _render_contrastive_cot_block(
+        self,
+        contrastive_cot: Optional[Dict[str, Any]],
+    ) -> str:
+        cot = contrastive_cot or {}
+        steps = cot.get("reasoning_steps", []) or []
+        evidence = cot.get("supporting_evidence", []) or []
+        focus_terms = cot.get("focus_terms", []) or []
+        trap_terms = cot.get("trap_terms", []) or []
+
+        evidence_lines = []
+        for item in evidence[:4]:
+            evidence_lines.append(
+                f"- [{item.get('id', '?')}] {item.get('law_name', '未知法律')} {item.get('article_num', '')}"
+                f" | focus_hits: {'、'.join(item.get('focus_hits', []) or []) or '无'}"
+                f" | trap_hits: {'、'.join(item.get('trap_hits', []) or []) or '无'}"
+            )
+
+        step_lines = []
+        for item in steps:
+            step_lines.append(f"- {item.get('step', '步骤')}：{item.get('content', '')}")
+
+        return (
+            "Contrastive CoT 约束：\n"
+            f"- 对比问题：{cot.get('contrast_query') or '无'}\n"
+            f"- 关键差异：{cot.get('delta') or '无'}\n"
+            f"- 应重点论证：{'、'.join([str(x) for x in focus_terms]) or '无'}\n"
+            f"- 应避免误用：{'、'.join([str(x) for x in trap_terms]) or '无'}\n"
+            "- 支持证据：\n"
+            f"{chr(10).join(evidence_lines) if evidence_lines else '- 暂无'}\n"
+            "- 推理骨架：\n"
+            f"{chr(10).join(step_lines) if step_lines else '- 暂无'}"
+        )
+
     def _synthesize_answer(
         self,
         query: str,
         evidence_items: List[Dict[str, Any]],
         issue_outline: List[Dict[str, str]],
+        contrastive_cot: Optional[Dict[str, Any]] = None,
     ) -> str:
         llm_cfg = self.config.llm
         if not self.llm_backend.is_available():
-            return self._fallback_answer(query, evidence_items, issue_outline)
+            return self._fallback_answer(
+                query,
+                evidence_items,
+                issue_outline,
+                contrastive_cot=contrastive_cot,
+            )
 
         evidence_blocks = []
         for item in evidence_items:
@@ -1844,49 +2156,58 @@ class LegalRAG:
             [f"- {item['title']}：{item['focus']}" for item in issue_outline]
         )
         answer_mode = self._detect_answer_mode(query, f"{query}\n{outline_text}")
+        contrastive_block = self._render_contrastive_cot_block(contrastive_cot)
 
         if answer_mode == "criminal_procedure_basis":
             task_guidance = (
                 "回答必须使用“刑事程序法检索问答”的语气，不要使用民商事请求权分析模板。\n"
                 "不要出现“权利基础与请求主体”“本金、利息”“请求支持范围”等民商事措辞，除非用户问题本身涉及这些内容。\n"
                 "应优先回答：1. 直接法律依据；2. 启动条件和决定机关；3. 办理程序与发布要求；4. 可直接引用的条号。\n"
+                "你必须先参考 Contrastive CoT 约束，区分真正适用的程序规则与表面相似但不应误用的规范。\n"
             )
             output_requirements = (
                 "1. 先给出“检索结论”，用 2-4 句直接回答用户问的程序和法条依据。\n"
                 "2. 然后按提纲逐项说明，每一段都尽量引用最直接的法条编号，如 [1][2]。\n"
-                "3. 最后给出“可直接引用的法条”，列出名称和条号。\n"
+                "3. 增加“对比辨析”小节，简要说明哪些规则适用、哪些规则容易误用。\n"
+                "4. 最后给出“可直接引用的法条”，列出名称和条号。\n"
             )
         elif answer_mode == "legal_basis_lookup":
             task_guidance = (
                 "回答应偏向“法条依据检索说明”，优先列出条文依据和适用条件，不要强行扩展成案件争点裁判分析。\n"
+                "你必须参考 Contrastive CoT 约束，明确适用边界并排除易混淆规范。\n"
             )
             output_requirements = (
                 "1. 先给出“检索结论”，简明回答核心规范依据。\n"
                 "2. 然后按提纲说明直接依据和适用条件。\n"
-                "3. 最后给出“可直接引用的法条”。\n"
+                "3. 增加“对比辨析”小节，说明与相似规范的边界差异。\n"
+                "4. 最后给出“可直接引用的法条”。\n"
             )
         else:
             task_guidance = (
                 "回答必须按争点分段，优先处理请求权基础、时间线、利息边界和裁判风险。\n"
                 "如果证据不足以直接得出结论，请明确写出“现有证据不足以判断”。\n"
                 "涉及金钱给付时，尽量拆分为本金、借期内利息、逾期利息/违约责任分别分析。\n"
+                "你必须参考 Contrastive CoT 约束，显式排除不适用或容易误用的法条路径。\n"
             )
             output_requirements = (
                 "1. 先给出“争点摘要”，用 2-4 句概括核心结论。\n"
                 "2. 然后逐个争点展开，每个争点单独成段，标题保持与提纲一致。\n"
                 "3. 每一段都尽量引用最直接的法条编号，如 [1][3]。\n"
-                "4. 最后给出“结论与建议”，明确哪些请求大概率支持、哪些需要调整。\n"
+                "4. 增加“对比辨析”小节，说明应适用法条与不应误用法条的边界。\n"
+                "5. 最后给出“结论与建议”，明确哪些请求大概率支持、哪些需要调整。\n"
             )
 
         prompt = (
             "你是法律分析助手。请严格基于给定证据回答用户问题，并在句末使用 [编号] 引用。\n"
             "不要编造未提供的法律依据，不要把未命中的规范当作已检索到的依据。\n"
+            "你要先在内部执行 Contrastive CoT 推理，再输出经过压缩后的结论，不要暴露冗长草稿。\n"
             f"{task_guidance}\n"
             f"用户问题：{query}\n\n"
             "请严格按照以下提纲组织回答：\n"
             f"{outline_text}\n\n"
             "输出要求：\n"
             f"{output_requirements}\n"
+            f"{contrastive_block}\n\n"
             "证据：\n"
             + "\n\n".join(evidence_blocks)
         )
@@ -1907,16 +2228,27 @@ class LegalRAG:
                 max_tokens=min(int(llm_cfg.max_tokens), 1200),
                 timeout=getattr(self.config.performance, "request_timeout", 120),
             )
-            return content or self._fallback_answer(query, evidence_items, issue_outline)
+            return content or self._fallback_answer(
+                query,
+                evidence_items,
+                issue_outline,
+                contrastive_cot=contrastive_cot,
+            )
         except Exception as e:
             logger.error(f"基于证据生成回答失败: {e}")
-            return self._fallback_answer(query, evidence_items, issue_outline)
+            return self._fallback_answer(
+                query,
+                evidence_items,
+                issue_outline,
+                contrastive_cot=contrastive_cot,
+            )
 
     def _fallback_answer(
         self,
         query: str,
         evidence_items: List[Dict[str, Any]],
         issue_outline: List[Dict[str, str]],
+        contrastive_cot: Optional[Dict[str, Any]] = None,
     ) -> str:
         answer_mode = self._detect_answer_mode(query, f"{query}\n" + "\n".join([item.get("title", "") for item in issue_outline]))
         summary_label = "检索结论" if answer_mode != "civil_issue_analysis" else "争点摘要"
@@ -1958,6 +2290,18 @@ class LegalRAG:
                 else:
                     lines.append("当前检索结果中缺少与该争点直接对应的法条，建议补充更明确的争议描述。")
             lines.append("")
+
+        cot = contrastive_cot or {}
+        lines.append("对比辨析：")
+        lines.append(
+            f"应重点关注：{'、'.join([str(x) for x in cot.get('focus_terms', [])]) or '现有命中法条的直接适用条件'}。"
+        )
+        lines.append(
+            f"应避免误用：{'、'.join([str(x) for x in cot.get('trap_terms', [])]) or '表面相似但法律关系不同的规范路径'}。"
+        )
+        if cot.get("delta"):
+            lines.append(f"关键差异：{cot.get('delta')}")
+        lines.append("")
 
         lines.append("可参考法条：")
         for item in evidence_items[:5]:

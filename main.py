@@ -61,6 +61,9 @@ class LawRAG:
         
         Args:
             limit: 限制处理的法律数量，None 表示处理全部
+            incremental: 是否增量构建，True 为增量，False 为全量
+            law_names: 指定要处理的法律名称列表，None 表示处理全部
+            full_refresh: 是否完全刷新（删除现有索引后重建）
         """
         index_builder = LawIndexBuilder()
         if full_refresh:
@@ -124,11 +127,32 @@ class LawRAG:
         """检索相关法律法规
         
         Args:
-            query: 检索查询
+            query: 检索查询文本
             top_k: 返回结果数量
+            case_date: 案件日期，用于过滤有效法条，格式 YYYY-MM-DD
             
         Returns:
-            List[dict]: 检索结果列表
+            List[dict]: 检索结果列表，每个结果包含：
+                - law_name: 法律名称
+                - article_num: 条号
+                - content: 内容
+                - score: 原始距离分数
+                - distance: 原始距离分数（与score相同）
+                - rerank_score: 重排后的分数
+                - path_match_score: 路径匹配分数
+                - legal_priority_score: 法律优先级分数
+                - legal_priority_reasons: 优先级原因列表
+                - locator: 体系定位
+                - hierarchy_path: 父级路径
+                - keyword_hits: 关键词命中列表
+                - path_hits: 路径命中列表
+                - path_focus_hits: 路径重点命中列表
+                - effective_keywords: 有效关键词列表
+                - keyword_idf: 关键词IDF字典
+                - effective_date: 生效日期
+                - repeal_date: 废止日期
+                - version_id: 版本标识
+                - is_current: 是否现行有效
         """
         filters = {"case_date": case_date} if case_date else None
         results = self.rag.search(query, filters=filters)
