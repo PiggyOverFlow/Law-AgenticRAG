@@ -190,13 +190,21 @@ class VectorDBManager:
                     "source_law_id": source_law_id,
                     "law_name": str(row.get("law_name") or "").strip(),
                     "source_hash": str(metadata.get("source_hash") or "").strip(),
+                    "source_hashes": [],
                     "version_id": str(metadata.get("version_id") or "").strip(),
+                    "version_ids": [],
                     "effective_date": str(metadata.get("effective_date") or row.get("effective_date") or "").strip(),
                     "repeal_date": str(metadata.get("repeal_date") or row.get("repeal_date") or "").strip(),
                     "chunk_ids": [],
                     "chunk_count": 0,
                 },
             )
+            source_hash = str(metadata.get("source_hash") or "").strip()
+            version_id = str(metadata.get("version_id") or "").strip()
+            if source_hash and source_hash not in item["source_hashes"]:
+                item["source_hashes"].append(source_hash)
+            if version_id and version_id not in item["version_ids"]:
+                item["version_ids"].append(version_id)
             chunk_id = str(row.get("id") or "").strip()
             if chunk_id:
                 item["chunk_ids"].append(chunk_id)

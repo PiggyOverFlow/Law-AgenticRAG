@@ -217,7 +217,7 @@ class QueryAgent:
         self.config = get_config()
         self.llm_backend = LLMBackend()
 
-    def should_rewrite(self, query: str) -> Dict[str, Any]:
+    def should_rewrite(self, query: str, context: str = "") -> Dict[str, Any]:
         """判断查询是否需要重写
         
         Args:
@@ -230,18 +230,19 @@ class QueryAgent:
         if not q:
             return {"should_rewrite": False, "reason": "empty_query"}
 
-        llm_result = self._llm_judge_query_completeness(q)
+        llm_result = self._llm_judge_query_completeness(q, context=context)
         if llm_result is not None:
             return llm_result
 
         incomplete_markers = ["这个", "这种", "该", "上述", "前述", "他", "她", "它", "怎么办", "如何处理","如何"]
-        should_rewrite = any(marker in q for marker in incomplete_markers) and len(q) <= 24
+        context_hint = bool(str(context or "").strip())
+        should_rewrite = any(marker in q for marker in incomplete_markers) and (len(q) <= 24 or context_hint)
         return {
             "should_rewrite": should_rewrite,
             "reason": "heuristic_incomplete_query" if should_rewrite else "heuristic_complete_query",
         }
 
-    def rewrite_query(self, query: str, force: bool = False) -> str:
+    def rewrite_query(self, query: str, context: str = "", force: bool = False) -> str:
         """重写查询文本，使其更完整和具体
         
         Args:
@@ -256,17 +257,19 @@ class QueryAgent:
             return q
 
         if not force:
-            decision = self.should_rewrite(q)
+            decision = self.should_rewrite(q, context=context)
             if not decision.get("should_rewrite", False):
                 return q
 
-        rewritten = self._llm_rewrite_query(q)
+        rewritten = self._llm_rewrite_query(q, context=context)
         if rewritten:
             return rewritten
 
         fallback = q
         fallback = fallback.replace("怎么办", "适用哪些法律条款以及如何处理")
         fallback = fallback.replace("怎么判", "司法实践中如何认定与裁判")
+        if context.strip():
+            fallback = f"基于以下上下文：{context[:240]}；当前问题：{fallback}"
         if fallback == q:
             fallback = f"{q} 相关法律条文 司法解释 适用要点"
         return re.sub(r"\s+", " ", fallback).strip()
@@ -366,12 +369,13 @@ class QueryAgent:
 
         return self._heuristic_plan_issue_queries(q, context=context, legal_elements=legal_elements)
 
-    def _llm_judge_query_completeness(self, query: str) -> Optional[Dict[str, Any]]:
+    def _llm_judge_query_completeness(self, query: str, context: str = "") -> Optional[Dict[str, Any]]:
         prompt = (
             "你是法律检索查询分析器。判断 query 是否信息完整，是否需要先改写。"
             "若包含模糊指代、上下文缺失、语义过短，建议改写。"
             "只输出 JSON：{\"should_rewrite\": bool, \"reason\": \"...\"}。\n"
-            f"query: {query}"
+            f"query: {query}\n"
+            f"context: {context}"
         )
         data = self._call_llm_json(prompt, temperature=0.1, max_tokens=200)
         if not data:
@@ -381,11 +385,12 @@ class QueryAgent:
             "reason": str(data.get("reason", "llm_decision")),
         }
 
-    def _llm_rewrite_query(self, query: str) -> Optional[str]:
+    def _llm_rewrite_query(self, query: str, context: str = "") -> Optional[str]:
         prompt = (
             "你是法律检索改写器。将 query 改写成更完整、更可检索的一句话，"
             "保持原意，不添加新事实。只输出 JSON：{\"rewrite\": \"...\"}。\n"
-            f"query: {query}"
+            f"query: {query}\n"
+            f"context: {context}"
         )
         data = self._call_llm_json(prompt, temperature=0.2, max_tokens=256)
         if not data:
@@ -1461,16 +1466,16 @@ class LegalRAG:
             replace_existing_sources: 是否替换已存在的源
         """
         if replace_existing_sources:
-            source_law_ids = sorted(
+            chunk_ids = sorted(
                 {
-                    str(chunk.metadata.get("source_law_id") or "").strip()
+                    str(chunk.chunk_id or "").strip()
                     for chunk in chunks
-                    if str(chunk.metadata.get("source_law_id") or "").strip()
+                    if str(chunk.chunk_id or "").strip()
                 }
             )
-            if source_law_ids:
-                deleted = self.vector_db.delete_chunks_by_source_law_ids(source_law_ids)
-                logger.info("索引写入前已清理 %s 部法律的旧版本，共删除 %s 个片段", len(source_law_ids), deleted)
+            if chunk_ids:
+                deleted = self.vector_db.delete_chunks_by_ids(chunk_ids)
+                logger.info("索引写入前已清理 %s 个同版本片段，共删除 %s 个旧片段", len(chunk_ids), deleted)
 
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
@@ -1510,6 +1515,7 @@ class LegalRAG:
         filters: Optional[Dict[str, Any]] = None,
         legal_elements: Optional[Dict[str, Any]] = None,
         primary_claim: Optional[Dict[str, Any]] = None,
+        conversation_context: str = "",
     ) -> Dict[str, Any]:
         """检索相关法律法规并返回完整轨迹
         
@@ -1551,11 +1557,24 @@ class LegalRAG:
         final_reranked_results: List[Dict[str, Any]] = []
         aggregated_candidates: Dict[str, Dict[str, Any]] = {}
         use_contrastive = bool(getattr(contrast_cfg, "enabled", False))
+        planning_context = str(conversation_context or "").strip()
         normalized_elements = (
             self.query_agent._normalize_legal_elements(legal_elements or {})
             if legal_elements
             else None
         )
+        if normalized_elements is None and planning_context:
+            try:
+                extracted_elements = self.query_agent.extract_legal_elements(
+                    original_query,
+                    context=planning_context,
+                )
+                normalized_elements = (
+                    extracted_elements if isinstance(extracted_elements, LegalElements) else None
+                )
+            except Exception as exc:
+                logger.warning("会话上下文法律要素抽取失败，回退空要素: %s", exc)
+                normalized_elements = None
         normalized_claim = self.query_agent._normalize_claim(primary_claim or {})
         contrastive_example = (
             self.query_agent.build_contrastive_example(
@@ -1567,9 +1586,9 @@ class LegalRAG:
             else ContrastiveExample(target_query=original_query)
         )
 
-        rewrite_decision = self.query_agent.should_rewrite(original_query)
+        rewrite_decision = self.query_agent.should_rewrite(original_query, context=planning_context)
         if rewrite_decision.get("should_rewrite", False):
-            rewritten = self.query_agent.rewrite_query(original_query, force=True)
+            rewritten = self.query_agent.rewrite_query(original_query, context=planning_context, force=True)
             if rewritten and rewritten != original_query:
                 previous_query = original_query
                 current_query = rewritten
@@ -1639,7 +1658,7 @@ class LegalRAG:
             if round_idx >= max_rounds:
                 break
 
-            next_query = self.query_agent.rewrite_query(current_query, force=True)
+            next_query = self.query_agent.rewrite_query(current_query, context=planning_context, force=True)
             if not next_query:
                 next_query = current_query
             if next_query == current_query:
@@ -1680,8 +1699,18 @@ class LegalRAG:
             "contrastive_cot": contrastive_cot,
         }
 
-    def answer_with_citations(self, query: str, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        search_result = self.search_with_trace(query, filters)
+    def answer_with_citations(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        conversation_context: str = "",
+        memory_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        search_result = self.search_with_trace(
+            query,
+            filters,
+            conversation_context=conversation_context,
+        )
         results = search_result.get("results", [])
 
         if not results:
@@ -1693,6 +1722,8 @@ class LegalRAG:
                 "keywords": search_result.get("keywords", []),
                 "contrastive_example": search_result.get("contrastive_example", {}),
                 "contrastive_cot": search_result.get("contrastive_cot", {}),
+                "conversation_context": conversation_context,
+                "memory_snapshot": memory_snapshot or {},
             }
 
         citations = []
@@ -1752,6 +1783,8 @@ class LegalRAG:
             "keywords": search_result.get("keywords", []),
             "contrastive_example": search_result.get("contrastive_example", {}),
             "contrastive_cot": contrastive_cot,
+            "conversation_context": conversation_context,
+            "memory_snapshot": memory_snapshot or {},
         }
 
     def _dense_search(self, query: str, filters: Dict[str, Any], top_k: int) -> List[Dict[str, Any]]:

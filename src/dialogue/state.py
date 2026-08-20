@@ -1,14 +1,4 @@
-from .legal_event import (
-    LegalEvent,
-    TextEvidence,
-    ImageEvidence,
-    AudioEvidence,
-    AudioSegment,
-    VideoEvidence,
-    VideoFrame,
-    CaseFacts
-)
-from .dialogue import (
+from src.models.dialogue import (
     AgentSemanticMemory,
     EpisodeRecord,
     IntentResult,
@@ -23,17 +13,9 @@ from .dialogue import (
 )
 
 __all__ = [
-    "LegalEvent",
-    "TextEvidence",
-    "ImageEvidence",
-    "AudioEvidence",
-    "AudioSegment",
-    "VideoEvidence",
-    "VideoFrame",
-    "CaseFacts",
+    "IntentResult",
     "AgentSemanticMemory",
     "EpisodeRecord",
-    "IntentResult",
     "MemoryEdge",
     "MemoryItem",
     "MemoryOperation",

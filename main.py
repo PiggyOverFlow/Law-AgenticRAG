@@ -7,6 +7,7 @@ from src.models import CaseFacts
 from src.parsers import MultimodalParser
 from src.rag import LegalRAG
 from src.agent import LegalAgent
+from src.dialogue import DialogueManager
 from src.generation import DocumentGenerator
 from src.data import LawIndexBuilder
 from src.evaluation import EvaluationFramework
@@ -26,6 +27,7 @@ class LawRAG:
         
         self.parser = MultimodalParser()
         self.rag = LegalRAG()
+        self.dialogue_manager = DialogueManager(self.rag)
         self.agent = LegalAgent()
         self.agent.set_rag(self.rag)
         self.document_generator = DocumentGenerator()
@@ -182,7 +184,13 @@ class LawRAG:
             for r in results[:top_k]
         ]
 
-    def answer_query(self, query: str, case_date: Optional[str] = None) -> dict:
+    def answer_query(
+        self,
+        query: str,
+        case_date: Optional[str] = None,
+        session_id: Optional[str] = None,
+        reset_session: bool = False,
+    ) -> dict:
         """基于法条证据回答用户问题并给出引用
         
         Args:
@@ -191,8 +199,19 @@ class LawRAG:
         Returns:
             dict: 包含回答、引用和检索轨迹的结果
         """
-        filters = {"case_date": case_date} if case_date else None
-        return self.rag.answer_with_citations(query, filters=filters)
+        return self.dialogue_manager.handle_qa_turn(
+            session_id=session_id or "default",
+            query=query,
+            case_date=case_date,
+            reset_session=reset_session,
+        )
+
+    def get_dialogue_session(self, session_id: Optional[str] = None) -> dict:
+        session = self.dialogue_manager.get_session(session_id or "default")
+        return session.model_dump()
+
+    def reset_dialogue_session(self, session_id: Optional[str] = None):
+        self.dialogue_manager.reset_session(session_id or "default")
 
     def evaluate_document(
         self,
@@ -262,6 +281,9 @@ def main():
     ask_parser = subparsers.add_parser("ask", help="基于法条证据回答并给出引用")
     ask_parser.add_argument("--query", required=True, help="用户问题")
     ask_parser.add_argument("--case-date", help="案件日期，按该日期过滤有效法条，格式 YYYY-MM-DD")
+    ask_parser.add_argument("--session-id", default="default", help="会话 ID，用于多轮对话")
+    ask_parser.add_argument("--reset-session", action="store_true", help="回答前重置当前会话")
+    ask_parser.add_argument("--show-memory", action="store_true", help="回答后显示当前会话记忆")
 
     finetune_parser = subparsers.add_parser("finetune", help="对本地 Qwen3-8B 执行 LoRA 微调")
     finetune_parser.add_argument("--data-path", default="./dataset/lora_data/最核心9k测试题_5k.json", help="LoRA 训练数据路径")
@@ -402,7 +424,19 @@ def main():
             print(f"   内容: {result['content'][:200]}...")
 
     elif args.command == "ask":
-        result = lawrag.answer_query(args.query, case_date=getattr(args, "case_date", None))
+        result = lawrag.answer_query(
+            args.query,
+            case_date=getattr(args, "case_date", None),
+            session_id=getattr(args, "session_id", "default"),
+            reset_session=bool(getattr(args, "reset_session", False)),
+        )
+
+        print(f"会话ID: {result.get('session_id', getattr(args, 'session_id', 'default'))}")
+        if result.get("dialogue_intent"):
+            print(f"对话意图: {result['dialogue_intent']}")
+        if result.get("resolved_query") and result.get("resolved_query") != args.query:
+            print(f"解析后问题: {result['resolved_query']}")
+        print("")
 
         issue_outline = result.get("issue_outline", [])
         if issue_outline:
@@ -438,6 +472,17 @@ def main():
                     f"- 第{step['round_index']}轮 | query={step['query_used']} "
                     f"| keywords={step['keywords']} | hits={step['vector_hits']}->{step['kept_hits']}"
                 )
+        if getattr(args, "show_memory", False):
+            memory = result.get("memory", {}) or {}
+            print("\n会话记忆:")
+            if memory.get("rolling_summary"):
+                print(f"- 历史摘要: {memory['rolling_summary']}")
+            if memory.get("confirmed_facts"):
+                print(f"- 已确认事实: {'；'.join(memory['confirmed_facts'])}")
+            if memory.get("unresolved_questions"):
+                print(f"- 未解决问题: {'；'.join(memory['unresolved_questions'])}")
+            if memory.get("last_answer_summary"):
+                print(f"- 上轮结论: {memory['last_answer_summary']}")
     
     elif args.command == "evaluate":
         with open(args.document, "r", encoding="utf-8") as f:

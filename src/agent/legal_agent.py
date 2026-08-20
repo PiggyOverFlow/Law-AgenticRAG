@@ -40,6 +40,8 @@ class AgentState(dict):
     contrastive_cot: dict = field(default_factory=dict)
     issue_plan: dict = field(default_factory=dict)
     legal_roles: dict = field(default_factory=dict)
+    draft_document: str | None = None
+    revision_report: dict = field(default_factory=dict)
     query_strategy: str = "focused"
     retry_reason: str = ""
     graph_max_steps: int = 30
@@ -827,7 +829,42 @@ class LegalAgent:
             },
             laws,
         )
-        state["generated_document"] = self._generate_document(prompt)
+        draft_document = self._generate_document(prompt)
+        revision_report = self._build_revision_report(
+            document=draft_document,
+            context={
+                "document_type": state.get("document_type", ""),
+                "user_request": state.get("user_request", ""),
+                "extracted_facts": state.get("extracted_facts", {}),
+                "case_facts": state.get("case_facts"),
+                "legal_roles": state.get("legal_roles", {}),
+            },
+            laws=laws,
+        )
+        revised_document = self._revise_document(
+            draft_document=draft_document,
+            revision_report=revision_report,
+            context={
+                "document_type": state.get("document_type", ""),
+                "user_request": state.get("user_request", ""),
+                "template": state.get("template", ""),
+                "extracted_facts": state.get("extracted_facts", {}),
+                "case_facts": state.get("case_facts"),
+                "legal_roles": state.get("legal_roles", {}),
+            },
+            laws=laws,
+        )
+        state["draft_document"] = draft_document
+        state["revision_report"] = revision_report
+        state["generated_document"] = revised_document
+        state["observations"].append(
+            {
+                "tool": "document_revision",
+                "draft_length": len(draft_document or ""),
+                "final_length": len(revised_document or ""),
+                "report": revision_report,
+            }
+        )
         return state
 
     # =============================================================================
@@ -946,6 +983,8 @@ class LegalAgent:
             contrastive_cot={},
             issue_plan={},
             legal_roles={},
+            draft_document=None,
+            revision_report={},
             query_strategy="focused",
             retry_reason="initial_pass",
             graph_max_steps=max(12, int(context.get("max_iterations", self.config.agent.max_iterations)) * 8),
@@ -979,6 +1018,8 @@ class LegalAgent:
         contrastive_cot = context.get("contrastive_cot", {}) or {}
         issue_plan = context.get("issue_plan", {}) or {}
         legal_roles = context.get("legal_roles", {}) or {}
+        style_guidance = self._infer_document_style(doc_type)
+        section_plan = self._build_document_section_plan(doc_type)
 
         fact_timeline = []
         if hasattr(case_facts, "events") and case_facts.events:
@@ -1004,6 +1045,7 @@ class LegalAgent:
             f"应避免误用：{'、'.join([str(x) for x in trap_terms]) or '无'}"
         )
         contrastive_cot_block = self._render_contrastive_cot_block(contrastive_cot, laws)
+        evidence_argument_map = self._build_evidence_argument_map(laws, context)
         subject_lines = []
         for item in legal_roles.get("subjects", [])[:12]:
             if isinstance(item, dict):
@@ -1038,9 +1080,14 @@ class LegalAgent:
 5. 若证据中出现明确利率/期限/本金，必须逐字沿用，不得改写为其他数值。
 6. 涉及利息请求时，必须明确写出计算基数、利率类型（月利率或年利率）、起算时间与截止时间。
 7. 先在内部执行 Contrastive CoT 审查，再将结论融入文书，不要把推理草稿直接写出来。
+8. 请按“分段生成”的思路组织正文，优先保证诉讼请求、事实与理由、法律依据和结论的完整性。
 
 文书类型：{doc_type}
 用户诉求：{user_request or '无'}
+文书风格要求：{style_guidance}
+
+建议段落规划：
+{section_plan}
 
 证据摘要：
 {evidence_summary or '无'}
@@ -1066,6 +1113,9 @@ class LegalAgent:
 Contrastive CoT 审查骨架：
 {contrastive_cot_block}
 
+证据-论证映射：
+{evidence_argument_map}
+
 事实时间线：
 {chr(10).join(fact_timeline) if fact_timeline else '无'}
 
@@ -1075,6 +1125,230 @@ Contrastive CoT 审查骨架：
 文书模板：
 {template or '无模板'}
 """
+
+    def _infer_document_style(self, doc_type: str) -> str:
+        styles = {
+            "起诉书": "采用主张型、请求导向的论述风格，强调请求权基础、事实经过与支持请求的法律依据。",
+            "答辩状": "采用抗辩型、回应式风格，围绕对方主张逐项回应，突出不成立、证据不足或适用边界。",
+            "上诉状": "采用纠错型、针对原裁判的论证风格，突出认定错误、适法错误与程序问题。",
+            "申请书": "采用事项导向风格，突出申请事项、事实基础与法律依据，表达简洁明确。",
+            "代理词": "采用论证型风格，强调争点展开、证据支撑和法条适用的层层论证。",
+        }
+        return styles.get(doc_type, "采用规范、克制且论证清晰的法律写作风格。")
+
+    def _build_document_section_plan(self, doc_type: str) -> str:
+        sections = {
+            "起诉书": [
+                "1. 当事人信息",
+                "2. 诉讼请求",
+                "3. 事实与理由",
+                "4. 法律依据与请求支持范围",
+                "5. 结尾与落款",
+            ],
+            "答辩状": [
+                "1. 答辩人信息",
+                "2. 答辩请求",
+                "3. 针对原告诉请的分点回应",
+                "4. 事实与法律理由",
+                "5. 结尾与落款",
+            ],
+            "上诉状": [
+                "1. 上诉人信息",
+                "2. 上诉请求",
+                "3. 上诉理由",
+                "4. 事实与法律依据",
+                "5. 结尾与落款",
+            ],
+            "申请书": [
+                "1. 申请人信息",
+                "2. 申请事项",
+                "3. 事实与理由",
+                "4. 法律依据",
+                "5. 结尾与落款",
+            ],
+            "代理词": [
+                "1. 开篇立场",
+                "2. 争点一及论证",
+                "3. 争点二及论证",
+                "4. 法律依据汇总",
+                "5. 结语",
+            ],
+        }
+        return "\n".join(sections.get(doc_type, ["1. 基本情况", "2. 主要主张", "3. 事实与理由", "4. 结尾"]))
+
+    def _build_evidence_argument_map(self, laws: List[Dict[str, Any]], context: Dict[str, Any]) -> str:
+        facts = context.get("extracted_facts", {}) or {}
+        disputes = list(facts.get("key_disputes", []) or [])
+        evidence_summary = str(facts.get("evidence_summary", "")).strip()
+        lines: List[str] = []
+
+        if evidence_summary:
+            lines.append(f"- 证据摘要总览：{self._clip_text(evidence_summary, 160)}")
+
+        for idx, law in enumerate(laws[:4], 1):
+            metadata = law.get("metadata") or {}
+            law_ref = f"{law.get('law_name', '未知法律')} {law.get('article_num', '')}".strip()
+            support = law.get("evidence_hits") or metadata.get("evidence_hits") or []
+            priority = law.get("legal_priority_reasons") or metadata.get("legal_priority_reasons") or []
+            mapped_issue = disputes[idx - 1] if idx - 1 < len(disputes) else "对应核心争议点"
+            lines.append(
+                f"- 映射 {idx}：争议“{mapped_issue}”优先参考 {law_ref}；"
+                f"事实支撑={('、'.join([str(x) for x in support[:4]]) if support else '待结合证据摘要展开')}；"
+                f"法律说明={('、'.join([str(x) for x in priority[:3]]) if priority else '按条文原文论证适用条件')}"
+            )
+
+        if not lines:
+            return "暂无可用映射，请根据证据摘要、争点和法条内容自行建立论证对应关系。"
+        return "\n".join(lines)
+
+    def _build_revision_report(
+        self,
+        document: str,
+        context: Dict[str, Any],
+        laws: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        content = str(document or "")
+        doc_type = str(context.get("document_type", "") or "法律文书")
+        legal_roles = context.get("legal_roles", {}) or {}
+        case_facts = context.get("case_facts")
+
+        required_sections_map = {
+            "起诉书": ["诉讼请求", "事实与理由"],
+            "答辩状": ["答辩请求", "事实与理由"],
+            "上诉状": ["上诉请求", "事实与理由"],
+            "申请书": ["申请事项", "事实与理由"],
+            "代理词": ["代理意见", "结语"],
+        }
+        required_sections = required_sections_map.get(doc_type, ["事实与理由"])
+        missing_sections = [section for section in required_sections if section not in content]
+
+        subjects = [str(item.get("name", "")).strip() for item in legal_roles.get("subjects", []) if str(item.get("name", "")).strip()]
+        missing_subjects = [name for name in subjects[:6] if name and name not in content]
+
+        timeline_markers: List[str] = []
+        if hasattr(case_facts, "events") and case_facts.events:
+            for event in case_facts.events[:5]:
+                if getattr(event, "time", None):
+                    timeline_markers.append(str(event.time).strip())
+        missing_timeline = [marker for marker in timeline_markers if marker and marker not in content]
+
+        cited_laws = [
+            f"{law.get('law_name', '')}{law.get('article_num', '')}".strip()
+            for law in laws[:5]
+            if law.get("law_name")
+        ]
+        citation_hits = [ref for ref in cited_laws if ref and ref in content]
+        uncited_laws = [ref for ref in cited_laws if ref and ref not in content]
+
+        request_markers = ["请求", "申请", "判令", "责令", "请求法院", "依法支持"]
+        request_completeness = any(marker in content for marker in request_markers)
+
+        return {
+            "document_type": doc_type,
+            "missing_sections": missing_sections,
+            "missing_subjects": missing_subjects,
+            "missing_timeline_markers": missing_timeline,
+            "uncited_laws": uncited_laws,
+            "citation_hits": citation_hits,
+            "request_completeness": request_completeness,
+        }
+
+    def _render_revision_report(self, report: Dict[str, Any]) -> str:
+        return (
+            f"- 缺失段落：{'、'.join(report.get('missing_sections', [])) or '无'}\n"
+            f"- 未覆盖主体：{'、'.join(report.get('missing_subjects', [])) or '无'}\n"
+            f"- 未覆盖时间线标记：{'、'.join(report.get('missing_timeline_markers', [])) or '无'}\n"
+            f"- 尚未引用的核心法条：{'、'.join(report.get('uncited_laws', [])) or '无'}\n"
+            f"- 已覆盖法条：{'、'.join(report.get('citation_hits', [])) or '无'}\n"
+            f"- 请求项是否完整：{'是' if report.get('request_completeness') else '否'}"
+        )
+
+    def _build_revision_prompt(
+        self,
+        draft_document: str,
+        revision_report: Dict[str, Any],
+        context: Dict[str, Any],
+        laws: List[Dict[str, Any]],
+    ) -> str:
+        doc_type = str(context.get("document_type", "") or "法律文书")
+        style_guidance = self._infer_document_style(doc_type)
+        section_plan = self._build_document_section_plan(doc_type)
+        evidence_map = self._build_evidence_argument_map(laws, context)
+        facts = context.get("extracted_facts", {}) or {}
+        evidence_summary = str(facts.get("evidence_summary", "")).strip()
+        key_disputes = "\n".join([f"- {d}" for d in (facts.get("key_disputes", []) or [])])
+
+        return f"""你是一名中国法律文书修订助手。请基于初稿和修订报告，输出一版更完整、更一致的最终文书正文。
+
+修订目标：
+1. 补齐缺失段落与请求项。
+2. 校验主体一致性，避免遗漏关键当事人。
+3. 校验时间线一致性，尽量覆盖核心时间信息。
+4. 校验法条引用完整性，优先结合已检索法条展开论证。
+5. 保持文书风格与文种一致，不输出解释过程，只输出修订后的最终正文。
+
+文书类型：{doc_type}
+风格要求：{style_guidance}
+
+建议段落规划：
+{section_plan}
+
+证据摘要：
+{evidence_summary or '无'}
+
+争议焦点：
+{key_disputes or '无'}
+
+证据-论证映射：
+{evidence_map}
+
+修订报告：
+{self._render_revision_report(revision_report)}
+
+初稿：
+{draft_document or '无'}
+"""
+
+    def _revise_document(
+        self,
+        draft_document: str,
+        revision_report: Dict[str, Any],
+        context: Dict[str, Any],
+        laws: List[Dict[str, Any]],
+    ) -> str:
+        llm_cfg = self.config.llm
+        if not self.llm_backend.is_available():
+            return draft_document
+
+        if not draft_document.strip():
+            return draft_document
+
+        revision_prompt = self._build_revision_prompt(
+            draft_document=draft_document,
+            revision_report=revision_report,
+            context=context,
+            laws=laws,
+        )
+
+        try:
+            content = self.llm_backend.generate(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是中国法律文书修订助手。必须严格基于初稿、事实和法条对文书做补全与修订，只输出最终修订稿。",
+                    },
+                    {"role": "user", "content": revision_prompt},
+                ],
+                temperature=min(float(llm_cfg.temperature), 0.4),
+                max_tokens=llm_cfg.max_tokens,
+                timeout=getattr(self.config.performance, "request_timeout", 120),
+            )
+            if not content:
+                return draft_document
+            return content
+        except Exception as e:
+            logger.error(f"文书修订调用失败: {e}")
+            return draft_document
 
     def _render_contrastive_cot_block(
         self,

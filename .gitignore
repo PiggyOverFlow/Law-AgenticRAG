@@ -81,8 +81,13 @@ temp/
 .coverage
 htmlcov/
 .tox/
+tests/
 
 # Documentation
 dataset/
+docs/
+
+# wandb
+wandb/
 
 output/

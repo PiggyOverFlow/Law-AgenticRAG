@@ -194,6 +194,27 @@ class PerformanceConfig:
     retry_delay: int
 
 
+@dataclass
+class DialogueConfig:
+    enabled: bool = True
+    session_backend: str = "sqlite"
+    session_table: str = "dialogue_sessions"
+    session_db_path: str = ""
+    recent_turn_window: int = 6
+    summary_trigger_turns: int = 8
+    max_history_chars: int = 4000
+    max_summary_chars: int = 1200
+    max_confirmed_facts: int = 20
+    max_unresolved_questions: int = 12
+    topic_recall_top_k: int = 3
+    memory_recall_top_k: int = 8
+    max_memory_items: int = 200
+    low_retention_threshold: float = 0.22
+    stale_retention_threshold: float = 0.35
+    invalidated_retention_days: int = 7
+    episode_window_turns: int = 12
+
+
 class Config:
     def __init__(self, config_path: str = "bootstrap.yaml"):
         self.config_path = Path(config_path)
@@ -299,6 +320,26 @@ class Config:
         )
         
         self.performance = PerformanceConfig(**self._raw_config["performance"])
+        dialogue_data = self._raw_config.get("dialogue", {})
+        self.dialogue = DialogueConfig(
+            enabled=dialogue_data.get("enabled", True),
+            session_backend=dialogue_data.get("session_backend", "sqlite"),
+            session_table=dialogue_data.get("session_table", "dialogue_sessions"),
+            session_db_path=dialogue_data.get("session_db_path", ""),
+            recent_turn_window=int(dialogue_data.get("recent_turn_window", 6)),
+            summary_trigger_turns=int(dialogue_data.get("summary_trigger_turns", 8)),
+            max_history_chars=int(dialogue_data.get("max_history_chars", 4000)),
+            max_summary_chars=int(dialogue_data.get("max_summary_chars", 1200)),
+            max_confirmed_facts=int(dialogue_data.get("max_confirmed_facts", 20)),
+            max_unresolved_questions=int(dialogue_data.get("max_unresolved_questions", 12)),
+            topic_recall_top_k=int(dialogue_data.get("topic_recall_top_k", 3)),
+            memory_recall_top_k=int(dialogue_data.get("memory_recall_top_k", 8)),
+            max_memory_items=int(dialogue_data.get("max_memory_items", 200)),
+            low_retention_threshold=float(dialogue_data.get("low_retention_threshold", 0.22)),
+            stale_retention_threshold=float(dialogue_data.get("stale_retention_threshold", 0.35)),
+            invalidated_retention_days=int(dialogue_data.get("invalidated_retention_days", 7)),
+            episode_window_turns=int(dialogue_data.get("episode_window_turns", 12)),
+        )
 
     def get(self, key: str, default: Any = None) -> Any:
         keys = key.split(".")
