@@ -88,6 +88,6 @@ dataset/
 docs/
 
 # wandb
-wandb/
+wandb/**
 
 output/
